@@ -1,0 +1,1085 @@
+/*
+ * linux/kernel/core_sched.c - LIH Core Scheduler
+ * 
+ * Scheduler híbrido que unifica:
+ *   - EEVDF (Earliest Eligible Virtual Deadline First) - Fair scheduling
+ *   - CFS (Completely Fair Scheduler) do Linux - Compatibility layer
+ * 
+ * Gerencia simultaneamente:
+ *   - thread_t do GNU Mach (microkernel threads)
+ *   - task_struct do Linux (Linux processes/threads)
+ * 
+ * Parte do projeto LIH (Linux Is Hybrid)
+ * 
+ * Licença: GPLv2
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/clock.h>
+#include <linux/sched/cputime.h>
+#include <linux/sched/deadline.h>
+#include <linux/sched/rt.h>
+#include <linux/sched/wake_q.h>
+#include <linux/rbtree.h>
+#include <linux/rbtree_augmented.h>
+#include <linux/percpu.h>
+#include <linux/smp.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
+#include <linux/kthread.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/slab.h>
+#include <linux/cpumask.h>
+#include <linux/cpuidle.h>
+#include <linux/time64.h>
+#include <linux/math64.h>
+#include <asm/irq_regs.h>
+
+/* Headers do GNU Mach (quando disponíveis) */
+#include <mach/mach_types.h>
+#include <mach/thread_status.h>
+#include <mach/schedule.h>
+
+/* ============================================================================
+ * Constantes e parâmetros do scheduler
+ * ============================================================================ */
+
+/* Parâmetros EEVDF */
+#define EEVDF_NSEC_PER_TICK     (1000000ULL)    /* 1ms por tick */
+#define EEVDF_MIN_GRANULARITY   (750000ULL)     /* 0.75ms mínimo */
+#define EEVDF_MAX_GRANULARITY   (24000000ULL)   /* 24ms máximo */
+#define EEVDF_LATENCY_TARGET    (20000000ULL)   /* 20ms latency target */
+#define EEVDF_WNADOW_SIZE       (6)             /* Janela de histórico */
+
+/* Parâmetros CFS (compatibilidade) */
+#define CFS_SYSCTL_NICE_0_LOAD  1024            /* Nice 0 load */
+#define CFS_MIN_SHARES          2               /* Shares mínimo */
+#define CFS_MAX_SHARES          (1ULL << 20)    /* ~1M shares máximo */
+
+/* Parâmetros do scheduler híbrido */
+#define MAX_PRIO_LEVELS         140             /* 0-139 (RT + normal) */
+#define DEFAULT_TIMESLICE_NS    (10000000ULL)   /* 10ms default */
+#define MIGRATION_COST_NS       (500000ULL)     /* 0.5ms custo migração */
+#define SCHED_BATCH_SIZE        32              /* Batch size para balancemento */
+
+/* Tipos de entidade no scheduler */
+#define SCHED_ENTITY_LINUX      0               /* Entidade Linux */
+#define SCHED_ENTITY_MACH       1               /* Entidade Mach */
+#define SCHED_ENTITY_HYBRID     2               /* Entidade híbrida */
+
+/* Estados de scheduling */
+#define SCHED_STATE_RUNNING     0
+#define SCHED_STATE_RUNNABLE    1
+#define SCHED_STATE_SLEEPING    2
+#define SCHED_STATE_BLOCKED     3
+#define SCHED_STATE_MIGRATING   4
+
+/* ============================================================================
+ * Estruturas de dados EEVDF
+ * ============================================================================ */
+
+/* Estrutura de virtual deadline para EEVDF */
+struct eevdf_deadline {
+    u64 virtual_time;           /* vruntime */
+    u64 deadline;               /* deadline absoluto */
+    u64 eligible_time;          /* tempo que ficou elegível */
+    u64 slice;                  /* time slice */
+    u64 lag;                    /* lag (diferença do tempo ideal) */
+    s64 priority_offset;        /* offset de prioridade */
+};
+
+/* Entidade de scheduling EEVDF (rbtree node) */
+struct sched_eevdf_entity {
+    struct rb_node node;        /* Nó na árvore EEVDF */
+    struct eevdf_deadline dl;   /* Deadline info */
+    
+    u64 exec_start;             /* Início da execução atual */
+    u64 sum_exec_runtime;       /* Tempo total executado */
+    u64 prev_sum_exec_runtime;  /* Tempo executado anterior */
+    
+    u64 nr_csw;                 /* Número de context switches */
+    u64 nr_forced_csw;          /* CSW forçados por preempção */
+    
+    unsigned int flags;         /* Flags da entidade */
+    int priority;               /* Prioridade (-20..19) */
+    int nice;                   /* Nice value */
+    
+    /* Estatísticas EEVDF */
+    u64 deadline_misses;        /* Perda de deadlines */
+    u64 avg_lag;                /* Lag médio */
+    u64 window_exec[EEVDF_WNADOW_SIZE]; /* Janela de execução */
+    int window_idx;             /* Índice na janela */
+};
+
+/* ============================================================================
+ * Estrutura principal do scheduler híbrido
+ * ============================================================================ */
+
+/* Entidade de scheduling abstrata (Linux ou Mach) */
+struct sched_entity_hybrid {
+    /* Identificação */
+    u64 id;                     /* ID único */
+    int type;                   /* SCHED_ENTITY_* */
+    void *native_entity;        /* task_struct ou thread_t nativo */
+    
+    /* Dados de scheduling EEVDF */
+    struct sched_eevdf_entity eevdf;
+    
+    /* Dados CFS (compatibilidade) */
+    struct load_weight load;    /* Load para CFS */
+    u64 vruntime;               /* CFS vruntime */
+    
+    /* Dados específicos por tipo */
+    union {
+        struct {
+            struct task_struct *task;
+            struct sched_entity *cfs_entity;
+            struct sched_rt_entity *rt_entity;
+            struct sched_dl_entity *dl_entity;
+        } linux;
+        struct {
+            thread_t thread;
+            thread_basic_info_data_t info;
+            thread_affinity_policy_data_t affinity;
+        } mach;
+    };
+    
+    /* Estado atual */
+    int state;                  /* SCHED_STATE_* */
+    int cpu;                    /* CPU atual */
+    int prev_cpu;               /* CPU anterior */
+    cpumask_t cpus_allowed;     /* CPUs permitidas */
+    
+    /* Sincronização */
+    spinlock_t lock;
+    atomic_t refcount;
+    
+    /* Callbacks de sistema */
+    void (*wakeup_callback)(struct sched_entity_hybrid *se);
+    void (*migrate_callback)(struct sched_entity_hybrid *se, int src_cpu, int dst_cpu);
+    void (*preempt_callback)(struct sched_entity_hybrid *se);
+};
+
+/* Runqueue híbrida (per-CPU) */
+struct hybrid_rq {
+    /* Estruturas EEVDF */
+    struct rb_root_cached eevdf_root;   /* Árvore EEVDF (eligibility) */
+    struct rb_root_cached deadline_root; /* Árvore por deadline */
+    
+    /* Estruturas CFS (compatibilidade) */
+    struct cfs_rq *cfs_rq;              /* CFS runqueue nativa */
+    struct rt_rq *rt_rq;                /* RT runqueue */
+    struct dl_rq *dl_rq;                /* Deadline runqueue */
+    
+    /* Entidades por prioridade */
+    struct sched_entity_hybrid *curr;   /* Entidade atual */
+    struct sched_entity_hybrid *next;   /* Próxima entidade */
+    struct sched_entity_hybrid *idle;   /* Idle task */
+    
+    /* Filas de entidades */
+    struct list_head runnable_list[MAX_PRIO_LEVELS];
+    struct list_head sleeping_list;
+    struct list_head migrating_list;
+    
+    /* Estatísticas */
+    u64 nr_running;                     /* Número de entidades runnable */
+    u64 nr_switches;                    /* Número de context switches */
+    u64 nr_preemptions;                 /* Número de preempções */
+    u64 nr_migrations;                  /* Número de migrações */
+    u64 avg_load;                       /* Carga média */
+    u64 total_slice;                    /* Total de slice disponível */
+    
+    /* Sincronização */
+    raw_spinlock_t lock;
+    atomic_t active_tasks;
+    
+    /* Balancemento */
+    struct sched_domain *sd;            /* Scheduling domain */
+    struct timer_list balance_timer;    /* Timer para balancemento */
+    u64 last_balance;                   /* Último balancemento */
+};
+
+/* Dados globais do scheduler */
+struct hybrid_sched_data {
+    struct hybrid_rq __percpu *rq;      /* Runqueues per-CPU */
+    struct cpumask active_cpus;         /* CPUs ativas */
+    
+    /* Parâmetros globais */
+    u64 sysctl_sched_latency;           /* Latência alvo */
+    u64 sysctl_sched_min_granularity;   /* Granularidade mínima */
+    u64 sysctl_sched_wakeup_granularity;/* Granularidade de wakeup */
+    u64 sysctl_sched_migration_cost;    /* Custo de migração */
+    
+    /* Tabelas de mapeamento */
+    struct idr linux_to_entity;         /* Mapeamento task_struct -> entity */
+    struct idr mach_to_entity;          /* Mapeamento thread_t -> entity */
+    
+    /* Threads de kernel */
+    struct task_struct *balance_thread; /* Thread de balancemento */
+    struct task_struct *deadline_thread;/* Thread de deadline monitor */
+    
+    /* Sincronização global */
+    spinlock_t global_lock;
+    atomic_t nr_entities;
+    
+    /* Estatísticas globais */
+    u64 total_entities_created;
+    u64 total_entities_destroyed;
+    u64 total_context_switches;
+};
+
+/* ============================================================================
+ * Funções EEVDF (Earliest Eligible Virtual Deadline First)
+ * ============================================================================ */
+
+/* Calcula o lag de uma entidade */
+static inline u64 eevdf_calculate_lag(struct sched_eevdf_entity *se)
+{
+    u64 ideal_time = se->sum_exec_runtime;
+    u64 actual_time = se->dl.virtual_time;
+    
+    if (actual_time >= ideal_time)
+        return actual_time - ideal_time;
+    else
+        return ideal_time - actual_time;
+}
+
+/* Calcula o deadline virtual */
+static inline u64 eevdf_calculate_deadline(struct sched_eevdf_entity *se, 
+                                            u64 now, 
+                                            u64 slice)
+{
+    u64 deadline;
+    
+    /* Deadline = tempo elegível + slice */
+    deadline = se->dl.eligible_time + slice;
+    
+    /* Aplica offset de prioridade */
+    if (se->dl.priority_offset > 0)
+        deadline += (se->dl.priority_offset * EEVDF_NSEC_PER_TICK);
+    else if (se->dl.priority_offset < 0)
+        deadline -= (abs(se->dl.priority_offset) * EEVDF_NSEC_PER_TICK);
+    
+    /* Clamp dentro dos limites */
+    if (deadline < now)
+        deadline = now + EEVDF_MIN_GRANULARITY;
+    
+    return deadline;
+}
+
+/* Atualiza o lag da entidade */
+static void eevdf_update_lag(struct sched_eevdf_entity *se)
+{
+    u64 new_lag = eevdf_calculate_lag(se);
+    
+    /* EWMA do lag */
+    if (se->avg_lag == 0)
+        se->avg_lag = new_lag;
+    else
+        se->avg_lag = (se->avg_lag * 7 + new_lag) / 8;
+    
+    se->dl.lag = new_lag;
+}
+
+/* Insere entidade na árvore EEVDF (ordenada por eligible_time + lag) */
+static void eevdf_enqueue(struct hybrid_rq *rq, 
+                           struct sched_entity_hybrid *entity)
+{
+    struct rb_node **link = &rq->eevdf_root.rb_root.rb_node;
+    struct rb_node *parent = NULL;
+    struct sched_entity_hybrid *entry;
+    u64 key;
+    
+    raw_spin_lock(&rq->lock);
+    
+    /* Calcula chave de ordenação (eligible_time + lag compensado) */
+    key = entity->eevdf.dl.eligible_time + entity->eevdf.dl.lag / 2;
+    
+    /* Encontra posição na árvore */
+    while (*link) {
+        parent = *link;
+        entry = rb_entry(parent, struct sched_entity_hybrid, eevdf.node);
+        
+        if (key < (entry->eevdf.dl.eligible_time + entry->eevdf.dl.lag / 2))
+            link = &parent->rb_left;
+        else
+            link = &parent->rb_right;
+    }
+    
+    /* Insere nó */
+    rb_link_node(&entity->eevdf.node, parent, link);
+    rb_insert_color(&entity->eevdf.node, &rq->eevdf_root.rb_root);
+    
+    rq->nr_running++;
+    
+    raw_spin_unlock(&rq->lock);
+}
+
+/* Remove entidade da árvore EEVDF */
+static void eevdf_dequeue(struct hybrid_rq *rq, 
+                           struct sched_entity_hybrid *entity)
+{
+    raw_spin_lock(&rq->lock);
+    
+    if (!RB_EMPTY_NODE(&entity->eevdf.node)) {
+        rb_erase(&entity->eevdf.node, &rq->eevdf_root.rb_root);
+        RB_CLEAR_NODE(&entity->eevdf.node);
+        rq->nr_running--;
+    }
+    
+    raw_spin_unlock(&rq->lock);
+}
+
+/* Seleciona a próxima entidade baseada em EEVDF */
+static struct sched_entity_hybrid *eevdf_pick_next(struct hybrid_rq *rq)
+{
+    struct sched_entity_hybrid *next = NULL;
+    struct rb_node *node;
+    u64 now = sched_clock_cpu(smp_processor_id());
+    
+    raw_spin_lock(&rq->lock);
+    
+    /* Pega a entidade com menor deadline elegível */
+    node = rb_first_cached(&rq->eevdf_root);
+    if (node) {
+        next = rb_entry(node, struct sched_entity_hybrid, eevdf.node);
+        
+        /* Verifica se o deadline já passou */
+        if (next->eevdf.dl.deadline < now) {
+            next->eevdf.deadline_misses++;
+            
+            /* Recalcula deadline para evitar starvation */
+            next->eevdf.dl.deadline = now + EEVDF_MIN_GRANULARITY;
+        }
+    }
+    
+    raw_spin_unlock(&rq->lock);
+    
+    return next;
+}
+
+/* Atualiza estatísticas EEVDF após execução */
+static void eevdf_update_stats(struct sched_entity_hybrid *entity, 
+                                u64 delta_exec)
+{
+    struct eevdf_deadline *dl = &entity->eevdf.dl;
+    
+    /* Atualiza tempo de execução total */
+    entity->eevdf.sum_exec_runtime += delta_exec;
+    
+    /* Atualiza virtual time baseado no delta */
+    dl->virtual_time += delta_exec;
+    
+    /* Atualiza janela de execução */
+    entity->eevdf.window_idx = (entity->eevdf.window_idx + 1) % EEVDF_WNADOW_SIZE;
+    entity->eevdf.window_exec[entity->eevdf.window_idx] = delta_exec;
+    
+    /* Recalcula lag */
+    eevdf_update_lag(&entity->eevdf);
+    
+    /* Atualiza deadline se necessário */
+    if (dl->virtual_time >= dl->deadline) {
+        dl->eligible_time = dl->deadline;
+        dl->deadline = eevdf_calculate_deadline(&entity->eevdf, 
+                                                  dl->deadline, 
+                                                  dl->slice);
+    }
+}
+
+/* ============================================================================
+ * Funções de gerenciamento de entidades híbridas
+ * ============================================================================ */
+
+/* Cria uma nova entidade de scheduling para uma task Linux */
+struct sched_entity_hybrid *hybrid_entity_create_linux(struct task_struct *task)
+{
+    struct sched_entity_hybrid *entity;
+    struct hybrid_sched_data *hsd = get_hybrid_sched_data();
+    int ret;
+    
+    if (!task || !hsd)
+        return ERR_PTR(-EINVAL);
+    
+    entity = kzalloc(sizeof(*entity), GFP_KERNEL);
+    if (!entity)
+        return ERR_PTR(-ENOMEM);
+    
+    /* Configura tipo */
+    entity->type = SCHED_ENTITY_LINUX;
+    entity->native_entity = task;
+    entity->id = task->pid;
+    
+    /* Configura entidade Linux */
+    entity->linux.task = task;
+    entity->linux.cfs_entity = &task->se;
+    entity->linux.rt_entity = &task->rt;
+    entity->linux.dl_entity = &task->dl;
+    
+    /* Configura prioridade */
+    entity->eevdf.priority = task_prio(task);
+    entity->eevdf.nice = task_nice(task);
+    
+    /* Configura EEVDF inicial */
+    entity->eevdf.dl.slice = DEFAULT_TIMESLICE_NS;
+    entity->eevdf.dl.eligible_time = sched_clock_cpu(task_cpu(task));
+    entity->eevdf.dl.deadline = entity->eevdf.dl.eligible_time + DEFAULT_TIMESLICE_NS;
+    
+    /* Configura carga CFS */
+    entity->load.weight = scale_load(task->se.load.weight);
+    entity->vruntime = task->se.vruntime;
+    
+    /* Configura CPU affinity */
+    entity->cpu = task_cpu(task);
+    cpumask_copy(&entity->cpus_allowed, &task->cpus_allowed);
+    
+    /* Inicializa lock */
+    spin_lock_init(&entity->lock);
+    atomic_set(&entity->refcount, 1);
+    
+    /* Registra no mapeamento */
+    ret = idr_alloc(&hsd->linux_to_entity, entity, task->pid, task->pid + 1, GFP_KERNEL);
+    if (ret < 0) {
+        kfree(entity);
+        return ERR_PTR(ret);
+    }
+    
+    /* Atualiza task_struct para apontar para entidade */
+    task->hybrid_entity = entity;
+    
+    atomic_inc(&hsd->nr_entities);
+    hsd->total_entities_created++;
+    
+    return entity;
+}
+
+/* Cria uma nova entidade de scheduling para uma thread Mach */
+struct sched_entity_hybrid *hybrid_entity_create_mach(thread_t thread)
+{
+    struct sched_entity_hybrid *entity;
+    struct hybrid_sched_data *hsd = get_hybrid_sched_data();
+    int ret;
+    
+    if (!thread || !hsd)
+        return ERR_PTR(-EINVAL);
+    
+    entity = kzalloc(sizeof(*entity), GFP_KERNEL);
+    if (!entity)
+        return ERR_PTR(-ENOMEM);
+    
+    /* Configura tipo */
+    entity->type = SCHED_ENTITY_MACH;
+    entity->native_entity = thread;
+    entity->id = (u64)(unsigned long)thread;
+    
+    /* Configura entidade Mach */
+    entity->mach.thread = thread;
+    
+    /* Obtém prioridade da thread Mach */
+    thread_get_basic_info(thread, &entity->mach.info);
+    entity->eevdf.priority = entity->mach.info.base_priority;
+    
+    /* Configura EEVDF */
+    entity->eevdf.dl.slice = DEFAULT_TIMESLICE_NS;
+    entity->eevdf.dl.eligible_time = sched_clock_cpu(smp_processor_id());
+    entity->eevdf.dl.deadline = entity->eevdf.dl.eligible_time + DEFAULT_TIMESLICE_NS;
+    
+    /* Configura CPU atual */
+    entity->cpu = smp_processor_id();
+    cpumask_setall(&entity->cpus_allowed);
+    
+    /* Inicializa lock */
+    spin_lock_init(&entity->lock);
+    atomic_set(&entity->refcount, 1);
+    
+    /* Registra no mapeamento */
+    ret = idr_alloc(&hsd->mach_to_entity, entity, (int)entity->id, 
+                     (int)entity->id + 1, GFP_KERNEL);
+    if (ret < 0) {
+        kfree(entity);
+        return ERR_PTR(ret);
+    }
+    
+    /* Associa thread à entidade */
+    thread->hybrid_entity = entity;
+    
+    atomic_inc(&hsd->nr_entities);
+    hsd->total_entities_created++;
+    
+    return entity;
+}
+
+/* Destroi uma entidade de scheduling */
+void hybrid_entity_destroy(struct sched_entity_hybrid *entity)
+{
+    struct hybrid_sched_data *hsd = get_hybrid_sched_data();
+    
+    if (!entity || !hsd)
+        return;
+    
+    if (atomic_dec_and_test(&entity->refcount)) {
+        /* Remove dos mapeamentos */
+        if (entity->type == SCHED_ENTITY_LINUX) {
+            idr_remove(&hsd->linux_to_entity, entity->linux.task->pid);
+            if (entity->linux.task)
+                entity->linux.task->hybrid_entity = NULL;
+        } else if (entity->type == SCHED_ENTITY_MACH) {
+            idr_remove(&hsd->mach_to_entity, (int)entity->id);
+            if (entity->mach.thread)
+                entity->mach.thread->hybrid_entity = NULL;
+        }
+        
+        /* Libera memória */
+        kfree(entity);
+        
+        atomic_dec(&hsd->nr_entities);
+        hsd->total_entities_destroyed++;
+    }
+}
+
+/* ============================================================================
+ * Funções principais de scheduling
+ * ============================================================================ */
+
+/* Adiciona entidade à runqueue */
+static void enqueue_entity(struct hybrid_rq *rq, 
+                            struct sched_entity_hybrid *entity)
+{
+    u64 now = sched_clock_cpu(rq->cpu);
+    
+    spin_lock(&entity->lock);
+    
+    entity->state = SCHED_STATE_RUNNABLE;
+    entity->eevdf.exec_start = now;
+    
+    /* Adiciona à fila por prioridade (fallback) */
+    int prio_idx = min(entity->eevdf.priority, MAX_PRIO_LEVELS - 1);
+    list_add_tail(&entity->eevdf.node, &rq->runnable_list[prio_idx]);
+    
+    /* Insere na árvore EEVDF */
+    eevdf_enqueue(rq, entity);
+    
+    spin_unlock(&entity->lock);
+}
+
+/* Remove entidade da runqueue */
+static void dequeue_entity(struct hybrid_rq *rq, 
+                            struct sched_entity_hybrid *entity)
+{
+    spin_lock(&entity->lock);
+    
+    entity->state = SCHED_STATE_SLEEPING;
+    
+    /* Remove das listas */
+    list_del_init(&entity->eevdf.node);
+    
+    /* Remove da árvore EEVDF */
+    eevdf_dequeue(rq, entity);
+    
+    spin_unlock(&entity->lock);
+}
+
+/* Função principal de schedule (similar ao schedule() do Linux) */
+asmlinkage void __sched hybrid_schedule(void)
+{
+    struct hybrid_rq *rq;
+    struct sched_entity_hybrid *prev, *next;
+    u64 now, delta_exec;
+    int cpu = smp_processor_id();
+    
+    rq = per_cpu_ptr(hybrid_sched_data.rq, cpu);
+    if (!rq)
+        return;
+    
+    raw_spin_lock_irq(&rq->lock);
+    
+    prev = rq->curr;
+    now = sched_clock_cpu(cpu);
+    
+    /* Atualiza estatísticas da entidade atual */
+    if (prev && prev->state == SCHED_STATE_RUNNING) {
+        delta_exec = now - prev->eevdf.exec_start;
+        if (delta_exec > 0) {
+            eevdf_update_stats(prev, delta_exec);
+            
+            /* Atualiza vruntime para compatibilidade CFS */
+            if (prev->type == SCHED_ENTITY_LINUX && prev->linux.cfs_entity) {
+                prev->linux.cfs_entity->vruntime += delta_exec;
+            }
+        }
+    }
+    
+    /* Seleciona próxima entidade usando EEVDF */
+    next = eevdf_pick_next(rq);
+    
+    /* Fallback para idle se não houver nada */
+    if (!next)
+        next = rq->idle;
+    
+    /* Verifica preempção */
+    if (next != prev) {
+        rq->nr_switches++;
+        
+        /* Marca preempção se necessário */
+        if (prev && prev->state == SCHED_STATE_RUNNING) {
+            prev->state = SCHED_STATE_RUNNABLE;
+            rq->nr_preemptions++;
+            prev->eevdf.nr_forced_csw++;
+        }
+        
+        /* Prepara próximo */
+        next->state = SCHED_STATE_RUNNING;
+        next->eevdf.exec_start = now;
+        next->eevdf.nr_csw++;
+        
+        /* Troca contexto */
+        rq->curr = next;
+        
+        raw_spin_unlock(&rq->lock);
+        
+        /* Chama switch_to apropriado baseado no tipo */
+        if (prev->type == SCHED_ENTITY_LINUX && next->type == SCHED_ENTITY_LINUX) {
+            /* Linux -> Linux: usa context_switch nativo */
+            context_switch(prev->linux.task, next->linux.task);
+        } else if (prev->type == SCHED_ENTITY_MACH && next->type == SCHED_ENTITY_MACH) {
+            /* Mach -> Mach: usa switch de thread Mach */
+            thread_switch(next->mach.thread, SWITCH_OPTION_DEPRESS);
+        } else {
+            /* Híbrido: precisa de switch especial */
+            hybrid_context_switch(prev, next);
+        }
+        
+        raw_spin_lock(&rq->lock);
+    }
+    
+    raw_spin_unlock_irq(&rq->lock);
+}
+
+/* Função de wakeup de entidade */
+void hybrid_wakeup_entity(struct sched_entity_hybrid *entity)
+{
+    struct hybrid_rq *rq;
+    int cpu;
+    
+    if (!entity || entity->state != SCHED_STATE_SLEEPING)
+        return;
+    
+    /* Escolhe CPU baseada na afinidade */
+    cpu = cpumask_first(&entity->cpus_allowed);
+    if (cpu >= nr_cpu_ids)
+        cpu = smp_processor_id();
+    
+    rq = per_cpu_ptr(hybrid_sched_data.rq, cpu);
+    
+    raw_spin_lock_irq(&rq->lock);
+    
+    /* Atualiza tempo elegível para evitar starvation */
+    entity->eevdf.dl.eligible_time = sched_clock_cpu(cpu);
+    entity->eevdf.dl.deadline = eevdf_calculate_deadline(&entity->eevdf,
+                                                           entity->eevdf.dl.eligible_time,
+                                                           entity->eevdf.dl.slice);
+    
+    enqueue_entity(rq, entity);
+    
+    /* Verifica se deve preemptar o atual */
+    if (rq->curr && eevdf_calculate_lag(&entity->eevdf) < 
+        eevdf_calculate_lag(&rq->curr->eevdf)) {
+        rq->nr_preemptions++;
+        set_tsk_need_resched(current);
+    }
+    
+    raw_spin_unlock_irq(&rq->lock);
+    
+    /* Chama callback */
+    if (entity->wakeup_callback)
+        entity->wakeup_callback(entity);
+}
+
+/* ============================================================================
+ * Balancemento de carga (Load Balancing)
+ * ============================================================================ */
+
+/* Calcula carga de uma runqueue */
+static u64 hybrid_rq_load(struct hybrid_rq *rq)
+{
+    struct sched_entity_hybrid *entry;
+    u64 total_load = 0;
+    int i;
+    
+    raw_spin_lock(&rq->lock);
+    
+    /* Soma carga de todas as entidades runnable */
+    for (i = 0; i < MAX_PRIO_LEVELS; i++) {
+        list_for_each_entry(entry, &rq->runnable_list[i], eevdf.node) {
+            if (entry->type == SCHED_ENTITY_LINUX)
+                total_load += entry->load.weight;
+            else if (entry->type == SCHED_ENTITY_MACH)
+                total_load += 1024; /* Peso padrão para threads Mach */
+        }
+    }
+    
+    rq->avg_load = (rq->avg_load * 3 + total_load) / 4;
+    
+    raw_spin_unlock(&rq->lock);
+    
+    return rq->avg_load;
+}
+
+/* Balanceia carga entre CPUs */
+static void hybrid_balance_load(void *data)
+{
+    struct hybrid_rq *rq;
+    struct hybrid_rq *busiest_rq = NULL;
+    struct sched_entity_hybrid *entity;
+    int cpu, target_cpu;
+    u64 load, max_load = 0;
+    
+    for_each_online_cpu(cpu) {
+        rq = per_cpu_ptr(hybrid_sched_data.rq, cpu);
+        load = hybrid_rq_load(rq);
+        
+        if (load > max_load) {
+            max_load = load;
+            busiest_rq = rq;
+        }
+    }
+    
+    if (!busiest_rq)
+        return;
+    
+    rq = per_cpu_ptr(hybrid_sched_data.rq, smp_processor_id());
+    
+    /* Encontra CPU com menor carga */
+    target_cpu = smp_processor_id();
+    for_each_online_cpu(cpu) {
+        if (cpu != target_cpu) {
+            u64 target_load = hybrid_rq_load(per_cpu_ptr(hybrid_sched_data.rq, cpu));
+            if (target_load < hybrid_rq_load(rq))
+                target_cpu = cpu;
+        }
+    }
+    
+    /* Migra entidade da runqueue mais ocupada */
+    raw_spin_lock(&busiest_rq->lock);
+    
+    if (!list_empty(&busiest_rq->runnable_list[0])) {
+        entity = list_first_entry(&busiest_rq->runnable_list[0], 
+                                   struct sched_entity_hybrid, 
+                                   eevdf.node);
+        
+        if (entity && cpumask_test_cpu(target_cpu, &entity->cpus_allowed)) {
+            dequeue_entity(busiest_rq, entity);
+            entity->cpu = target_cpu;
+            entity->prev_cpu = busiest_rq->cpu;
+            entity->state = SCHED_STATE_MIGRATING;
+            
+            raw_spin_unlock(&busiest_rq->lock);
+            
+            /* Migra para nova runqueue */
+            rq = per_cpu_ptr(hybrid_sched_data.rq, target_cpu);
+            raw_spin_lock(&rq->lock);
+            enqueue_entity(rq, entity);
+            raw_spin_unlock(&rq->lock);
+            
+            if (entity->migrate_callback)
+                entity->migrate_callback(entity, busiest_rq->cpu, target_cpu);
+            
+            hybrid_sched_data.total_context_switches++;
+        } else {
+            raw_spin_unlock(&busiest_rq->lock);
+        }
+    } else {
+        raw_spin_unlock(&busiest_rq->lock);
+    }
+}
+
+/* Timer de balancemento periódico */
+static void hybrid_balance_timer(struct timer_list *timer)
+{
+    struct hybrid_rq *rq = from_timer(rq, timer, balance_timer);
+    u64 now = sched_clock_cpu(rq->cpu);
+    
+    if (now - rq->last_balance > (MSEC_PER_SEC * 10)) {
+        rq->last_balance = now;
+        hybrid_balance_load(NULL);
+    }
+    
+    mod_timer(&rq->balance_timer, jiffies + msecs_to_jiffies(100));
+}
+
+/* ============================================================================
+ * Interface com o Mach (chamadas de sistema do scheduler)
+ * ============================================================================ */
+
+/* syscall Mach: thread_policy_set - compatível com Mach */
+kern_return_t hybrid_thread_policy_set(thread_t thread, 
+                                         policy_t policy,
+                                         struct policy_base *base,
+                                         mach_msg_type_number_t count)
+{
+    struct sched_entity_hybrid *entity;
+    struct hybrid_sched_data *hsd = get_hybrid_sched_data();
+    
+    if (!hsd)
+        return KERN_FAILURE;
+    
+    entity = idr_find(&hsd->mach_to_entity, (int)(unsigned long)thread);
+    if (!entity)
+        return KERN_INVALID_ARGUMENT;
+    
+    spin_lock(&entity->lock);
+    
+    switch (policy) {
+    case SCHED_RR:
+    case SCHED_FIFO:
+        /* Prioridade RT */
+        if (count >= sizeof(struct sched_param)) {
+            struct sched_param *param = (struct sched_param *)base;
+            entity->eevdf.priority = param->sched_priority;
+            entity->eevdf.dl.priority_offset = param->sched_priority - 20;
+        }
+        break;
+        
+    case SCHED_OTHER:
+        /* Normal priority */
+        if (count >= sizeof(int)) {
+            int *nice = (int *)base;
+            entity->eevdf.nice = *nice;
+            entity->eevdf.priority = 120 + *nice;
+        }
+        break;
+        
+    case SCHED_DEADLINE:
+        /* Deadline scheduling */
+        if (count >= sizeof(struct sched_dl_entity)) {
+            struct sched_dl_entity *dl = (struct sched_dl_entity *)base;
+            entity->eevdf.dl.slice = dl->sched_runtime;
+            entity->eevdf.dl.deadline = eevdf_calculate_deadline(&entity->eevdf,
+                                                                    sched_clock(),
+                                                                    dl->sched_runtime);
+        }
+        break;
+    }
+    
+    spin_unlock(&entity->lock);
+    
+    return KERN_SUCCESS;
+}
+
+/* syscall Mach: thread_policy_get */
+kern_return_t hybrid_thread_policy_get(thread_t thread,
+                                         policy_t policy,
+                                         struct policy_base *base,
+                                         mach_msg_type_number_t *count)
+{
+    struct sched_entity_hybrid *entity;
+    struct hybrid_sched_data *hsd = get_hybrid_sched_data();
+    
+    if (!hsd)
+        return KERN_FAILURE;
+    
+    entity = idr_find(&hsd->mach_to_entity, (int)(unsigned long)thread);
+    if (!entity)
+        return KERN_INVALID_ARGUMENT;
+    
+    spin_lock(&entity->lock);
+    
+    switch (policy) {
+    case SCHED_OTHER:
+        if (*count >= sizeof(int)) {
+            int *nice = (int *)base;
+            *nice = entity->eevdf.nice;
+            *count = sizeof(int);
+        }
+        break;
+        
+    case SCHED_RR:
+    case SCHED_FIFO:
+        if (*count >= sizeof(struct sched_param)) {
+            struct sched_param *param = (struct sched_param *)base;
+            param->sched_priority = entity->eevdf.priority;
+            *count = sizeof(struct sched_param);
+        }
+        break;
+    }
+    
+    spin_unlock(&entity->lock);
+    
+    return KERN_SUCCESS;
+}
+
+/* ============================================================================
+ * Interface com o Linux (syscalls do scheduler)
+ * ============================================================================ */
+
+/* syscall Linux: sched_setaffinity - adaptada para entidades híbridas */
+long hybrid_sched_setaffinity(pid_t pid, unsigned int len, cpumask_t *user_mask)
+{
+    struct task_struct *task;
+    struct sched_entity_hybrid *entity;
+    struct hybrid_sched_data *hsd = get_hybrid_sched_data();
+    
+    if (!hsd)
+        return -ENOSYS;
+    
+    rcu_read_lock();
+    task = find_task_by_vpid(pid);
+    if (!task) {
+        rcu_read_unlock();
+        return -ESRCH;
+    }
+    
+    entity = idr_find(&hsd->linux_to_entity, pid);
+    if (!entity) {
+        rcu_read_unlock();
+        return -ESRCH;
+    }
+    
+    spin_lock(&entity->lock);
+    cpumask_copy(&entity->cpus_allowed, user_mask);
+    spin_unlock(&entity->lock);
+    
+    rcu_read_unlock();
+    
+    return 0;
+}
+
+/* syscall Linux: sched_yield - yield voluntário */
+void hybrid_sched_yield(void)
+{
+    struct hybrid_rq *rq;
+    struct sched_entity_hybrid *current_entity;
+    
+    if (!current || !current->hybrid_entity)
+        return;
+    
+    rq = per_cpu_ptr(hybrid_sched_data.rq, smp_processor_id());
+    current_entity = current->hybrid_entity;
+    
+    if (current_entity && current_entity->state == SCHED_STATE_RUNNING) {
+        /* Move para o final da fila */
+        dequeue_entity(rq, current_entity);
+        current_entity->eevdf.dl.eligible_time = sched_clock();
+        enqueue_entity(rq, current_entity);
+        
+        /* Força reschedule */
+        set_tsk_need_resched(current);
+    }
+}
+
+/* ============================================================================
+ * Inicialização e setup do scheduler
+ * ============================================================================ */
+
+static struct hybrid_sched_data *hybrid_sched_data;
+
+static int __init hybrid_scheduler_init(void)
+{
+    int cpu, ret;
+    
+    printk(KERN_INFO "LIH Core Scheduler: Inicializando scheduler híbrido\n");
+    
+    /* Aloca dados globais */
+    hybrid_sched_data = kzalloc(sizeof(*hybrid_sched_data), GFP_KERNEL);
+    if (!hybrid_sched_data)
+        return -ENOMEM;
+    
+    /* Aloca runqueues per-CPU */
+    hybrid_sched_data->rq = alloc_percpu(struct hybrid_rq);
+    if (!hybrid_sched_data->rq) {
+        kfree(hybrid_sched_data);
+        return -ENOMEM;
+    }
+    
+    /* Inicializa runqueues */
+    for_each_possible_cpu(cpu) {
+        struct hybrid_rq *rq = per_cpu_ptr(hybrid_sched_data->rq, cpu);
+        
+        rq->eevdf_root = RB_ROOT_CACHED;
+        rq->deadline_root = RB_ROOT_CACHED;
+        
+        for (int i = 0; i < MAX_PRIO_LEVELS; i++)
+            INIT_LIST_HEAD(&rq->runnable_list[i]);
+        
+        INIT_LIST_HEAD(&rq->sleeping_list);
+        INIT_LIST_HEAD(&rq->migrating_list);
+        
+        raw_spin_lock_init(&rq->lock);
+        rq->cpu = cpu;
+        
+        /* Inicializa timer de balancemento */
+        timer_setup(&rq->balance_timer, hybrid_balance_timer, 0);
+        mod_timer(&rq->balance_timer, jiffies + msecs_to_jiffies(100));
+    }
+    
+    /* Inicializa IDRs */
+    idr_init(&hybrid_sched_data->linux_to_entity);
+    idr_init(&hybrid_sched_data->mach_to_entity);
+    
+    /* Configura parâmetros */
+    hybrid_sched_data->sysctl_sched_latency = EEVDF_LATENCY_TARGET;
+    hybrid_sched_data->sysctl_sched_min_granularity = EEVDF_MIN_GRANULARITY;
+    hybrid_sched_data->sysctl_sched_wakeup_granularity = EEVDF_NSEC_PER_TICK;
+    hybrid_sched_data->sysctl_sched_migration_cost = MIGRATION_COST_NS;
+    
+    /* Inicializa CPUMask */
+    cpumask_setall(&hybrid_sched_data->active_cpus);
+    
+    /* Spinlock global */
+    spin_lock_init(&hybrid_sched_data->global_lock);
+    atomic_set(&hybrid_sched_data->nr_entities, 0);
+    
+    printk(KERN_INFO "LIH Core Scheduler: Inicializado com sucesso\n");
+    printk(KERN_INFO "  - EEVDF latency: %llu ns\n", EEVDF_LATENCY_TARGET);
+    printk(KERN_INFO "  - Min granularity: %llu ns\n", EEVDF_MIN_GRANULARITY);
+    printk(KERN_INFO "  - Max CPUs: %d\n", nr_cpu_ids);
+    
+    return 0;
+}
+
+static void __exit hybrid_scheduler_exit(void)
+{
+    int cpu;
+    
+    printk(KERN_INFO "LIH Core Scheduler: Finalizando...\n");
+    
+    /* Para timers */
+    for_each_possible_cpu(cpu) {
+        struct hybrid_rq *rq = per_cpu_ptr(hybrid_sched_data->rq, cpu);
+        del_timer_sync(&rq->balance_timer);
+    }
+    
+    /* Libera IDRs */
+    idr_destroy(&hybrid_sched_data->linux_to_entity);
+    idr_destroy(&hybrid_sched_data->mach_to_entity);
+    
+    /* Libera runqueues */
+    free_percpu(hybrid_sched_data->rq);
+    
+    /* Libera dados globais */
+    kfree(hybrid_sched_data);
+    
+    printk(KERN_INFO "LIH Core Scheduler: Finalizado\n");
+}
+
+module_init(hybrid_scheduler_init);
+module_exit(hybrid_scheduler_exit);
+
+/* Exporta símbolos para outros módulos */
+EXPORT_SYMBOL(hybrid_schedule);
+EXPORT_SYMBOL(hybrid_wakeup_entity);
+EXPORT_SYMBOL(hybrid_entity_create_linux);
+EXPORT_SYMBOL(hybrid_entity_create_mach);
+EXPORT_SYMBOL(hybrid_entity_destroy);
+EXPORT_SYMBOL(hybrid_thread_policy_set);
+EXPORT_SYMBOL(hybrid_thread_policy_get);
+EXPORT_SYMBOL(hybrid_sched_setaffinity);
+EXPORT_SYMBOL(hybrid_sched_yield);
+
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("LIH Project");
+MODULE_DESCRIPTION("LIH Core Scheduler - EEVDF/CFS Hybrid Scheduler for Linux + Mach");
+MODULE_VERSION("2.0");
