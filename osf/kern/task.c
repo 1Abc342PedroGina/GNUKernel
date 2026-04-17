@@ -2978,6 +2978,21 @@ void task_update_schedule_time(task_t task)
 }
 
 /*
+ * Trace and perf event structures
+ */
+struct task_trace_event {
+    unsigned int type;
+    unsigned long long data;
+    unsigned long long timestamp;
+};
+
+struct task_perf_event {
+    unsigned int type;
+    unsigned long long value;
+    unsigned long long timestamp;
+};
+
+/*
  * task_get_scheduling_stats
  *
  * Get scheduling statistics for a task.
@@ -6988,3 +7003,2069 @@ struct audit_event {
     unsigned int    result;
     unsigned int    data[8];
 };
+
+/*
+ * Additional Task Management Functions - Part 2
+ * Advanced task lifecycle management, container support, and debugging
+ */
+
+/*
+ * Function: task_set_container_id
+ *
+ * Set container ID for task (for containerization support)
+ */
+kern_return_t task_set_container_id(task_t task, unsigned long long container_id)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->container_id = container_id;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_container_id
+ *
+ * Get container ID of task
+ */
+unsigned long long task_get_container_id(task_t task)
+{
+    unsigned long long container_id;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    container_id = task->container_id;
+    task_unlock(task);
+    
+    return container_id;
+}
+
+/*
+ * Function: task_set_cgroup_path
+ *
+ * Set cgroup path for task
+ */
+kern_return_t task_set_cgroup_path(task_t task, const char *cgroup_path)
+{
+    if (task == TASK_NULL || cgroup_path == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    strncpy(task->cgroup_path, cgroup_path, PATH_MAX - 1);
+    task->cgroup_path[PATH_MAX - 1] = '\0';
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_cgroup_path
+ *
+ * Get cgroup path of task
+ */
+const char *task_get_cgroup_path(task_t task)
+{
+    if (task == TASK_NULL)
+        return NULL;
+    
+    return task->cgroup_path;
+}
+
+/*
+ * Function: task_set_oom_score_adj_custom
+ *
+ * Set custom OOM score adjustment with range validation
+ */
+kern_return_t task_set_oom_score_adj_custom(task_t task, int oom_adj)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* OOM adjustment range: -1000 to 1000 */
+    if (oom_adj < -1000 || oom_adj > 1000)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->oom_score_adj = oom_adj;
+    task->oom_score = task_calculate_oom_score(task);
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_oom_score
+ *
+ * Get current OOM score
+ */
+int task_get_oom_score(task_t task)
+{
+    int score;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    score = task->oom_score;
+    task_unlock(task);
+    
+    return score;
+}
+
+/*
+ * Function: task_set_io_class
+ *
+ * Set I/O class for task (for I/O scheduling)
+ */
+kern_return_t task_set_io_class(task_t task, unsigned int io_class)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (io_class > 3) /* 0=RT, 1=BE, 2=IDLE, 3=Best-effort */
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->io_class = io_class;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_io_class
+ *
+ * Get I/O class of task
+ */
+unsigned int task_get_io_class(task_t task)
+{
+    unsigned int io_class;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    io_class = task->io_class;
+    task_unlock(task);
+    
+    return io_class;
+}
+
+/*
+ * Function: task_set_io_weight
+ *
+ * Set I/O weight for task (for proportional I/O scheduling)
+ */
+kern_return_t task_set_io_weight(task_t task, unsigned int weight)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Weight range: 100-1000 */
+    if (weight < 100 || weight > 1000)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->io_weight = weight;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_io_weight
+ *
+ * Get I/O weight of task
+ */
+unsigned int task_get_io_weight(task_t task)
+{
+    unsigned int weight;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    weight = task->io_weight;
+    task_unlock(task);
+    
+    return weight;
+}
+
+/*
+ * Function: task_set_memory_hard_limit
+ *
+ * Set hard memory limit for task
+ */
+kern_return_t task_set_memory_hard_limit(task_t task, unsigned long long limit_bytes)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->memory_hard_limit = limit_bytes;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_set_memory_soft_limit
+ *
+ * Set soft memory limit for task
+ */
+kern_return_t task_set_memory_soft_limit(task_t task, unsigned long long limit_bytes)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->memory_soft_limit = limit_bytes;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_memory_usage
+ *
+ * Get current memory usage of task
+ */
+unsigned long long task_get_memory_usage(task_t task)
+{
+    unsigned long long usage;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    usage = task->current_memory;
+    task_unlock(task);
+    
+    return usage;
+}
+
+/*
+ * Function: task_get_memory_limit
+ *
+ * Get memory limits of task
+ */
+void task_get_memory_limits(task_t task, unsigned long long *hard_limit, 
+                             unsigned long long *soft_limit)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (hard_limit != NULL)
+        *hard_limit = task->memory_hard_limit;
+    if (soft_limit != NULL)
+        *soft_limit = task->memory_soft_limit;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_check_memory_exceeded
+ *
+ * Check if task exceeded memory limits
+ */
+boolean_t task_check_memory_exceeded(task_t task)
+{
+    boolean_t exceeded = FALSE;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    if (task->memory_hard_limit > 0 && task->current_memory > task->memory_hard_limit)
+        exceeded = TRUE;
+    else if (task->memory_soft_limit > 0 && task->current_memory > task->memory_soft_limit)
+        exceeded = TRUE;
+    task_unlock(task);
+    
+    return exceeded;
+}
+
+/*
+ * Function: task_set_cpu_quota
+ *
+ * Set CPU quota for task (CFS bandwidth control)
+ */
+kern_return_t task_set_cpu_quota(task_t task, unsigned int quota_us, unsigned int period_us)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (quota_us == 0 || period_us == 0)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->cpu_quota_us = quota_us;
+    task->cpu_period_us = period_us;
+    task->cpu_quota_used = 0;
+    task->cpu_quota_reset_time = mach_absolute_time();
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_cpu_quota
+ *
+ * Get CPU quota settings of task
+ */
+void task_get_cpu_quota(task_t task, unsigned int *quota_us, unsigned int *period_us)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (quota_us != NULL)
+        *quota_us = task->cpu_quota_us;
+    if (period_us != NULL)
+        *period_us = task->cpu_period_us;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_account_cpu_usage
+ *
+ * Account CPU usage for quota enforcement
+ */
+void task_account_cpu_usage(task_t task, unsigned long long cpu_time_ns)
+{
+    unsigned long long now;
+    unsigned long long period_elapsed;
+    
+    if (task == TASK_NULL || task->cpu_quota_us == 0)
+        return;
+    
+    task_lock(task);
+    
+    now = mach_absolute_time();
+    period_elapsed = now - task->cpu_quota_reset_time;
+    
+    /* Check if period elapsed */
+    if (period_elapsed >= (task->cpu_period_us * 1000ULL)) {
+        task->cpu_quota_used = 0;
+        task->cpu_quota_reset_time = now;
+    }
+    
+    task->cpu_quota_used += cpu_time_ns;
+    
+    /* Check if quota exceeded */
+    if (task->cpu_quota_used > (task->cpu_quota_us * 1000ULL)) {
+        /* Throttle the task */
+        task->throttle_count = 1;
+        task->cpu_throttled = TRUE;
+    }
+    
+    task_unlock(task);
+}
+
+/*
+ * Function: task_is_cpu_throttled
+ *
+ * Check if task is CPU throttled
+ */
+boolean_t task_is_cpu_throttled(task_t task)
+{
+    boolean_t throttled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    throttled = task->cpu_throttled;
+    task_unlock(task);
+    
+    return throttled;
+}
+
+/*
+ * Function: task_set_network_class
+ *
+ * Set network class for task (for network QoS)
+ */
+kern_return_t task_set_network_class(task_t task, unsigned int net_class)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (net_class > 7) /* 0-7 network priority levels */
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->network_class = net_class;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_network_class
+ *
+ * Get network class of task
+ */
+unsigned int task_get_network_class(task_t task)
+{
+    unsigned int net_class;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    net_class = task->network_class;
+    task_unlock(task);
+    
+    return net_class;
+}
+
+/*
+ * Function: task_set_network_bandwidth
+ *
+ * Set network bandwidth limit for task
+ */
+kern_return_t task_set_network_bandwidth(task_t task, unsigned long long bandwidth_bps)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->network_bandwidth_limit = bandwidth_bps;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_network_bandwidth
+ *
+ * Get network bandwidth limit of task
+ */
+unsigned long long task_get_network_bandwidth(task_t task)
+{
+    unsigned long long bandwidth;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    bandwidth = task->network_bandwidth_limit;
+    task_unlock(task);
+    
+    return bandwidth;
+}
+
+/*
+ * Function: task_account_network_usage
+ *
+ * Account network usage for bandwidth enforcement
+ */
+void task_account_network_usage(task_t task, unsigned long long bytes, boolean_t is_tx)
+{
+    if (task == TASK_NULL || task->network_bandwidth_limit == 0)
+        return;
+    
+    task_lock(task);
+    
+    if (is_tx) {
+        task->network_tx_bytes += bytes;
+    } else {
+        task->network_rx_bytes += bytes;
+    }
+    
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_network_stats
+ *
+ * Get network statistics of task
+ */
+void task_get_network_stats(task_t task, unsigned long long *tx_bytes, 
+                             unsigned long long *rx_bytes)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (tx_bytes != NULL)
+        *tx_bytes = task->network_tx_bytes;
+    if (rx_bytes != NULL)
+        *rx_bytes = task->network_rx_bytes;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_set_security_level
+ *
+ * Set security level for task (MAC/Seccomp)
+ */
+kern_return_t task_set_security_level(task_t task, unsigned int level)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (level > 3) /* 0=disabled, 1=strict, 2=enforcing, 3=permissive */
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->security_level = level;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_security_level
+ *
+ * Get security level of task
+ */
+unsigned int task_get_security_level(task_t task)
+{
+    unsigned int level;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    level = task->security_level;
+    task_unlock(task);
+    
+    return level;
+}
+
+/*
+ * Function: task_set_audit_enabled
+ *
+ * Enable or disable auditing for task
+ */
+void task_set_audit_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->audit_enabled = enabled;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_is_audit_enabled
+ *
+ * Check if auditing is enabled for task
+ */
+boolean_t task_is_audit_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->audit_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_trace_enabled
+ *
+ * Enable or disable tracing for task
+ */
+void task_set_trace_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->trace_enabled = enabled;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_is_trace_enabled
+ *
+ * Check if tracing is enabled for task
+ */
+boolean_t task_is_trace_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->trace_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_add_trace_event
+ *
+ * Add trace event to task's trace buffer
+ */
+void task_add_trace_event(task_t task, unsigned int event_type, 
+                           unsigned long long event_data)
+{
+    unsigned int idx;
+    
+    if (task == TASK_NULL || !task->trace_enabled)
+        return;
+    
+    task_lock(task);
+    
+    idx = task->trace_index % TASK_TRACE_BUFFER_SIZE;
+    task->trace_events[idx].type = event_type;
+    task->trace_events[idx].data = event_data;
+    task->trace_events[idx].timestamp = mach_absolute_time();
+    task->trace_index++;
+    
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_trace_events
+ *
+ * Get trace events from task's buffer
+ */
+unsigned int task_get_trace_events(task_t task, struct task_trace_event *buffer, 
+                                    unsigned int max_events)
+{
+    unsigned int i, count;
+    
+    if (task == TASK_NULL || buffer == NULL || max_events == 0)
+        return 0;
+    
+    task_lock(task);
+    
+    count = (task->trace_index > max_events) ? max_events : task->trace_index;
+    
+    for (i = 0; i < count; i++) {
+        buffer[i] = task->trace_events[i];
+    }
+    
+    task_unlock(task);
+    
+    return count;
+}
+
+/*
+ * Function: task_set_perf_event_enabled
+ *
+ * Enable or disable performance events for task
+ */
+void task_set_perf_event_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->perf_event_enabled = enabled;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_is_perf_event_enabled
+ *
+ * Check if performance events are enabled for task
+ */
+boolean_t task_is_perf_event_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->perf_event_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_record_perf_event
+ *
+ * Record performance event for task
+ */
+void task_record_perf_event(task_t task, unsigned int event_type, 
+                             unsigned long long event_value)
+{
+    unsigned int idx;
+    
+    if (task == TASK_NULL || !task->perf_event_enabled)
+        return;
+    
+    task_lock(task);
+    
+    idx = task->perf_event_index % TASK_PERF_BUFFER_SIZE;
+    task->perf_events[idx].type = event_type;
+    task->perf_events[idx].value = event_value;
+    task->perf_events[idx].timestamp = mach_absolute_time();
+    task->perf_event_index++;
+    
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_perf_events
+ *
+ * Get performance events from task's buffer
+ */
+unsigned int task_get_perf_events(task_t task, struct task_perf_event *buffer,
+                                   unsigned int max_events)
+{
+    unsigned int i, count;
+    
+    if (task == TASK_NULL || buffer == NULL || max_events == 0)
+        return 0;
+    
+    task_lock(task);
+    
+    count = (task->perf_event_index > max_events) ? max_events : task->perf_event_index;
+    
+    for (i = 0; i < count; i++) {
+        buffer[i] = task->perf_events[i];
+    }
+    
+    task_unlock(task);
+    
+    return count;
+}
+
+/*
+ * Function: task_set_stack_limit
+ *
+ * Set stack size limit for task
+ */
+kern_return_t task_set_stack_limit(task_t task, unsigned long long stack_limit)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->rlim_stack = stack_limit;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_stack_limit
+ *
+ * Get stack size limit of task
+ */
+unsigned long long task_get_stack_limit(task_t task)
+{
+    unsigned long long limit;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    limit = task->rlim_stack;
+    task_unlock(task);
+    
+    return limit;
+}
+
+/*
+ * Function: task_set_file_limit
+ *
+ * Set file size limit for task
+ */
+kern_return_t task_set_file_limit(task_t task, unsigned long long file_limit)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->rlim_fsize = file_limit;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_file_limit
+ *
+ * Get file size limit of task
+ */
+unsigned long long task_get_file_limit(task_t task)
+{
+    unsigned long long limit;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    limit = task->rlim_fsize;
+    task_unlock(task);
+    
+    return limit;
+}
+
+/*
+ * Function: task_set_core_dump_enabled
+ *
+ * Enable or disable core dump for task
+ */
+void task_set_core_dump_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->core_dump_enabled = enabled;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_is_core_dump_enabled
+ *
+ * Check if core dump is enabled for task
+ */
+boolean_t task_is_core_dump_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->core_dump_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_syscall_filter
+ *
+ * Set syscall filter bitmap for task (seccomp)
+ */
+kern_return_t task_set_syscall_filter(task_t task, unsigned long long *filter, 
+                                       unsigned int filter_words)
+{
+    unsigned int i;
+    
+    if (task == TASK_NULL || filter == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (filter_words > 16) /* Max 1024 syscalls */
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    
+    for (i = 0; i < filter_words && i < 16; i++) {
+        task->syscall_filter[i] = filter[i];
+    }
+    task->syscall_filter_words = filter_words;
+    
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_check_syscall_allowed
+ *
+ * Check if syscall is allowed for task
+ */
+boolean_t task_check_syscall_allowed(task_t task, unsigned int syscall_nr)
+{
+    unsigned int word_idx = syscall_nr / 64;
+    unsigned int bit_idx = syscall_nr % 64;
+    
+    if (task == TASK_NULL)
+        return TRUE;
+    
+    if (word_idx >= task->syscall_filter_words)
+        return TRUE;
+    
+    return (task->syscall_filter[word_idx] & (1ULL << bit_idx)) != 0;
+}
+
+/*
+ * Function: task_set_syscall_audit
+ *
+ * Enable syscall auditing for specific syscalls
+ */
+kern_return_t task_set_syscall_audit(task_t task, unsigned long long *audit_mask,
+                                      unsigned int mask_words)
+{
+    unsigned int i;
+    
+    if (task == TASK_NULL || audit_mask == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (mask_words > 16)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    
+    for (i = 0; i < mask_words && i < 16; i++) {
+        task->syscall_audit_mask[i] = audit_mask[i];
+    }
+    task->syscall_audit_words = mask_words;
+    
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_should_audit_syscall
+ *
+ * Check if syscall should be audited
+ */
+boolean_t task_should_audit_syscall(task_t task, unsigned int syscall_nr)
+{
+    unsigned int word_idx = syscall_nr / 64;
+    unsigned int bit_idx = syscall_nr % 64;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    if (word_idx >= task->syscall_audit_words)
+        return FALSE;
+    
+    return (task->syscall_audit_mask[word_idx] & (1ULL << bit_idx)) != 0;
+}
+
+/*
+ * Function: task_record_syscall
+ *
+ * Record syscall execution for task
+ */
+void task_record_syscall(task_t task, unsigned int syscall_nr, 
+                          unsigned long long duration_ns, kern_return_t result)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    
+    task->syscall_count++;
+    if (syscall_nr < 512) {
+        task->syscall_stats[syscall_nr]++;
+        task->syscall_durations[syscall_nr] += duration_ns;
+    }
+    
+    if (result != KERN_SUCCESS) {
+        task->syscall_errors++;
+        if (syscall_nr < 512) {
+            task->syscall_errors_by_nr[syscall_nr]++;
+        }
+    }
+    
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_syscall_stats
+ *
+ * Get syscall statistics for task
+ */
+void task_get_syscall_stats(task_t task, unsigned int syscall_nr,
+                             unsigned long long *count, 
+                             unsigned long long *total_duration_ns,
+                             unsigned long long *errors)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    
+    if (count != NULL)
+        *count = (syscall_nr < 512) ? task->syscall_stats[syscall_nr] : 0;
+    if (total_duration_ns != NULL)
+        *total_duration_ns = (syscall_nr < 512) ? task->syscall_durations[syscall_nr] : 0;
+    if (errors != NULL)
+        *errors = (syscall_nr < 512) ? task->syscall_errors_by_nr[syscall_nr] : 0;
+    
+    task_unlock(task);
+}
+
+/*
+ * Constants for trace and perf buffers
+ */
+#define TASK_TRACE_BUFFER_SIZE 4096
+#define TASK_PERF_BUFFER_SIZE 2048
+
+/*
+ * Additional Task Management Functions - Part 3
+ * Advanced task scheduling, NUMA migration, power management, and debugging
+ */
+
+/*
+ * Function: task_set_power_profile
+ *
+ * Set power consumption profile for task
+ */
+kern_return_t task_set_power_profile(task_t task, unsigned int profile)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* 0=performance, 1=balanced, 2=power_saver, 3=low_power */
+    if (profile > 3)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->power_profile = profile;
+    task->last_power_profile_change = mach_absolute_time();
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_power_profile
+ *
+ * Get power consumption profile of task
+ */
+unsigned int task_get_power_profile(task_t task)
+{
+    unsigned int profile;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    profile = task->power_profile;
+    task_unlock(task);
+    
+    return profile;
+}
+
+/*
+ * Function: task_set_energy_aware_scheduling
+ *
+ * Enable/disable energy-aware scheduling for task
+ */
+kern_return_t task_set_energy_aware_scheduling(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->energy_aware_scheduling = enabled;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_energy_aware
+ *
+ * Check if task uses energy-aware scheduling
+ */
+boolean_t task_is_energy_aware(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->energy_aware_scheduling;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_thermal_throttle
+ *
+ * Set thermal throttle threshold for task
+ */
+kern_return_t task_set_thermal_throttle(task_t task, unsigned int temperature_threshold_c)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (temperature_threshold_c < 50 || temperature_threshold_c > 120)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->thermal_threshold = temperature_threshold_c;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_check_thermal_throttle
+ *
+ * Check if task should be throttled due to temperature
+ */
+boolean_t task_check_thermal_throttle(task_t task, unsigned int current_temp)
+{
+    boolean_t should_throttle = FALSE;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    if (task->thermal_threshold > 0 && current_temp >= task->thermal_threshold) {
+        should_throttle = TRUE;
+        task->thermal_throttle_count++;
+        task->last_thermal_throttle = mach_absolute_time();
+    }
+    task_unlock(task);
+    
+    return should_throttle;
+}
+
+/*
+ * Function: task_set_dark_wake
+ *
+ * Enable/disable dark wake (wake from sleep for background tasks)
+ */
+kern_return_t task_set_dark_wake(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->dark_wake_enabled = enabled;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_dark_wake_enabled
+ *
+ * Check if dark wake is enabled for task
+ */
+boolean_t task_is_dark_wake_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->dark_wake_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_prefetch_enabled
+ *
+ * Enable/disable memory prefetching for task
+ */
+kern_return_t task_set_prefetch_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->prefetch_enabled = enabled;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_prefetch_enabled
+ *
+ * Check if prefetching is enabled for task
+ */
+boolean_t task_is_prefetch_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->prefetch_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_prefetch_depth
+ *
+ * Set prefetch depth for task
+ */
+kern_return_t task_set_prefetch_depth(task_t task, unsigned int depth)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (depth == 0 || depth > 32)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->prefetch_depth = depth;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_prefetch_depth
+ *
+ * Get prefetch depth of task
+ */
+unsigned int task_get_prefetch_depth(task_t task)
+{
+    unsigned int depth;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    depth = task->prefetch_depth;
+    task_unlock(task);
+    
+    return depth;
+}
+
+/*
+ * Function: task_set_latency_sensitivity
+ *
+ * Set latency sensitivity level for task (for real-time)
+ */
+kern_return_t task_set_latency_sensitivity(task_t task, unsigned int level)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* 0-100, higher = more sensitive */
+    if (level > 100)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->latency_sensitivity = level;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_latency_sensitivity
+ *
+ * Get latency sensitivity level of task
+ */
+unsigned int task_get_latency_sensitivity(task_t task)
+{
+    unsigned int level;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    level = task->latency_sensitivity;
+    task_unlock(task);
+    
+    return level;
+}
+
+/*
+ * Function: task_set_dma_allowed
+ *
+ * Set DMA access permission for task
+ */
+kern_return_t task_set_dma_allowed(task_t task, boolean_t allowed)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->dma_allowed = allowed;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_dma_allowed
+ *
+ * Check if DMA access is allowed for task
+ */
+boolean_t task_is_dma_allowed(task_t task)
+{
+    boolean_t allowed;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    allowed = task->dma_allowed;
+    task_unlock(task);
+    
+    return allowed;
+}
+
+/*
+ * Function: task_set_io_uring_enabled
+ *
+ * Enable/disable io_uring for task
+ */
+kern_return_t task_set_io_uring_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->io_uring_enabled = enabled;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_io_uring_enabled
+ *
+ * Check if io_uring is enabled for task
+ */
+boolean_t task_is_io_uring_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->io_uring_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_io_uring_entries
+ *
+ * Set io_uring queue entries limit for task
+ */
+kern_return_t task_set_io_uring_entries(task_t task, unsigned int max_entries)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (max_entries == 0 || max_entries > 32768)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->io_uring_max_entries = max_entries;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_io_uring_entries
+ *
+ * Get io_uring queue entries limit of task
+ */
+unsigned int task_get_io_uring_entries(task_t task)
+{
+    unsigned int entries;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    entries = task->io_uring_max_entries;
+    task_unlock(task);
+    
+    return entries;
+}
+
+/*
+ * Function: task_set_futex_robust
+ *
+ * Enable/disable robust futex handling for task
+ */
+kern_return_t task_set_futex_robust(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->futex_robust_enabled = enabled;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_futex_robust
+ *
+ * Check if robust futex is enabled for task
+ */
+boolean_t task_is_futex_robust(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->futex_robust_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_vdso_enabled
+ *
+ * Enable/disable vDSO optimization for task
+ */
+kern_return_t task_set_vdso_enabled(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->vdso_enabled = enabled;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_vdso_enabled
+ *
+ * Check if vDSO is enabled for task
+ */
+boolean_t task_is_vdso_enabled(task_t task)
+{
+    boolean_t enabled;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    enabled = task->vdso_enabled;
+    task_unlock(task);
+    
+    return enabled;
+}
+
+/*
+ * Function: task_set_tls_model
+ *
+ * Set TLS (Thread Local Storage) model for task
+ */
+kern_return_t task_set_tls_model(task_t task, unsigned int model)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* 0=initial-exec, 1=local-dynamic, 2=local-exec */
+    if (model > 2)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->tls_model = model;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_tls_model
+ *
+ * Get TLS model of task
+ */
+unsigned int task_get_tls_model(task_t task)
+{
+    unsigned int model;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    model = task->tls_model;
+    task_unlock(task);
+    
+    return model;
+}
+
+/*
+ * Function: task_set_restricted_mode
+ *
+ * Enable/disable restricted mode (sandbox) for task
+ */
+kern_return_t task_set_restricted_mode(task_t task, boolean_t enabled)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->restricted_mode = enabled;
+    
+    /* Disable dangerous capabilities */
+    if (enabled) {
+        task->capability_effective &= ~(CAP_SYS_ADMIN | CAP_SYS_RAWIO | 
+                                         CAP_SYS_PTRACE | CAP_SYS_MODULE);
+    }
+    
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_restricted
+ *
+ * Check if task is in restricted mode
+ */
+boolean_t task_is_restricted(task_t task)
+{
+    boolean_t restricted;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    restricted = task->restricted_mode;
+    task_unlock(task);
+    
+    return restricted;
+}
+
+/*
+ * Function: task_set_seccomp_actions
+ *
+ * Set seccomp action for specific syscalls
+ */
+kern_return_t task_set_seccomp_actions(task_t task, unsigned int syscall_nr, 
+                                        unsigned int action)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (syscall_nr >= 512)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* 0=allow, 1=kill, 2=trap, 3=errno, 4=trace, 5=log */
+    if (action > 5)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->seccomp_actions[syscall_nr] = action;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_seccomp_action
+ *
+ * Get seccomp action for syscall
+ */
+unsigned int task_get_seccomp_action(task_t task, unsigned int syscall_nr)
+{
+    unsigned int action = 0; /* allow by default */
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    if (syscall_nr >= 512)
+        return 0;
+    
+    task_lock(task);
+    action = task->seccomp_actions[syscall_nr];
+    task_unlock(task);
+    
+    return action;
+}
+
+/*
+ * Function: task_set_ptrace_scope
+ *
+ * Set ptrace scope restriction for task
+ */
+kern_return_t task_set_ptrace_scope(task_t task, unsigned int scope)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* 0=full, 1=children, 2=process, 3=none */
+    if (scope > 3)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->ptrace_scope = scope;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_ptrace_scope
+ *
+ * Get ptrace scope of task
+ */
+unsigned int task_get_ptrace_scope(task_t task)
+{
+    unsigned int scope;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    scope = task->ptrace_scope;
+    task_unlock(task);
+    
+    return scope;
+}
+
+/*
+ * Function: task_set_child_subreaper
+ *
+ * Set task as child subreaper (inherits orphaned children)
+ */
+kern_return_t task_set_child_subreaper(task_t task, boolean_t subreaper)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->child_subreaper = subreaper;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_child_subreaper
+ *
+ * Check if task is child subreaper
+ */
+boolean_t task_is_child_subreaper(task_t task)
+{
+    boolean_t subreaper;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    subreaper = task->child_subreaper;
+    task_unlock(task);
+    
+    return subreaper;
+}
+
+/*
+ * Function: task_adopt_orphaned_child
+ *
+ * Adopt orphaned child task (for subreaper)
+ */
+kern_return_t task_adopt_orphaned_child(task_t task, task_t orphan)
+{
+    if (task == TASK_NULL || orphan == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task_lock(orphan);
+    
+    /* Remove from old parent */
+    if (orphan->parent != TASK_NULL) {
+        queue_remove(&orphan->parent->children, orphan, task_t, sibling);
+        task_deallocate(orphan->parent);
+    }
+    
+    /* Adopt as child */
+    orphan->parent = task;
+    task_reference(task);
+    queue_enter(&task->children, orphan, task_t, sibling);
+    
+    task_unlock(orphan);
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_set_dumpable
+ *
+ * Set dumpable flag for core dumps
+ */
+kern_return_t task_set_dumpable(task_t task, boolean_t dumpable)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->dumpable = dumpable;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_is_dumpable
+ *
+ * Check if task is dumpable
+ */
+boolean_t task_is_dumpable(task_t task)
+{
+    boolean_t dumpable;
+    
+    if (task == TASK_NULL)
+        return FALSE;
+    
+    task_lock(task);
+    dumpable = task->dumpable;
+    task_unlock(task);
+    
+    return dumpable;
+}
+
+/*
+ * Function: task_set_min_flt
+ *
+ * Set minimum fault threshold for task
+ */
+void task_set_min_flt(task_t task, unsigned int min_flt)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->min_flt = min_flt;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_set_maj_flt
+ *
+ * Set major fault threshold for task
+ */
+void task_set_maj_flt(task_t task, unsigned int maj_flt)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->maj_flt = maj_flt;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_fault_stats
+ *
+ * Get fault statistics for task
+ */
+void task_get_fault_stats(task_t task, unsigned int *min_flt, 
+                           unsigned int *maj_flt, unsigned int *cow_flt)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (min_flt != NULL)
+        *min_flt = task->min_flt;
+    if (maj_flt != NULL)
+        *maj_flt = task->maj_flt;
+    if (cow_flt != NULL)
+        *cow_flt = task->cow_faults;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_context_switches
+ *
+ * Get context switch statistics for task
+ */
+void task_get_context_switches(task_t task, unsigned int *voluntary, 
+                                unsigned int *involuntary)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (voluntary != NULL)
+        *voluntary = task->voluntary_switches;
+    if (involuntary != NULL)
+        *involuntary = task->involuntary_switches;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_ipc_stats
+ *
+ * Get IPC statistics for task
+ */
+void task_get_ipc_stats(task_t task, unsigned long long *sent, 
+                         unsigned long long *received)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (sent != NULL)
+        *sent = task->messages_sent;
+    if (received != NULL)
+        *received = task->messages_received;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_get_io_priority
+ *
+ * Get I/O priority of task
+ */
+unsigned int task_get_io_priority(task_t task)
+{
+    unsigned int priority;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    priority = task->io_priority;
+    task_unlock(task);
+    
+    return priority;
+}
+
+/*
+ * Function: task_set_io_read_limit
+ *
+ * Set I/O read limit for task (bytes per second)
+ */
+kern_return_t task_set_io_read_limit(task_t task, unsigned long long limit_bps)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->io_read_limit = limit_bps;
+    task->io_read_start_time = mach_absolute_time();
+    task->io_read_bytes_this_period = 0;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_set_io_write_limit
+ *
+ * Set I/O write limit for task (bytes per second)
+ */
+kern_return_t task_set_io_write_limit(task_t task, unsigned long long limit_bps)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->io_write_limit = limit_bps;
+    task->io_write_start_time = mach_absolute_time();
+    task->io_write_bytes_this_period = 0;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_io_limits
+ *
+ * Get I/O limits of task
+ */
+void task_get_io_limits(task_t task, unsigned long long *read_limit,
+                         unsigned long long *write_limit)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (read_limit != NULL)
+        *read_limit = task->io_read_limit;
+    if (write_limit != NULL)
+        *write_limit = task->io_write_limit;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_account_io_read
+ *
+ * Account I/O read for rate limiting
+ */
+boolean_t task_account_io_read(task_t task, unsigned long long bytes)
+{
+    unsigned long long now;
+    unsigned long long period_ns = 1000000000ULL; /* 1 second */
+    boolean_t allowed = TRUE;
+    
+    if (task == TASK_NULL || task->io_read_limit == 0)
+        return TRUE;
+    
+    task_lock(task);
+    
+    now = mach_absolute_time();
+    
+    /* Reset period if elapsed */
+    if (now - task->io_read_start_time >= period_ns) {
+        task->io_read_start_time = now;
+        task->io_read_bytes_this_period = 0;
+    }
+    
+    /* Check limit */
+    if (task->io_read_bytes_this_period + bytes > task->io_read_limit) {
+        allowed = FALSE;
+        task->io_read_throttled_count++;
+    } else {
+        task->io_read_bytes_this_period += bytes;
+    }
+    
+    task_unlock(task);
+    
+    return allowed;
+}
+
+/*
+ * Function: task_account_io_write
+ *
+ * Account I/O write for rate limiting
+ */
+boolean_t task_account_io_write(task_t task, unsigned long long bytes)
+{
+    unsigned long long now;
+    unsigned long long period_ns = 1000000000ULL; /* 1 second */
+    boolean_t allowed = TRUE;
+    
+    if (task == TASK_NULL || task->io_write_limit == 0)
+        return TRUE;
+    
+    task_lock(task);
+    
+    now = mach_absolute_time();
+    
+    /* Reset period if elapsed */
+    if (now - task->io_write_start_time >= period_ns) {
+        task->io_write_start_time = now;
+        task->io_write_bytes_this_period = 0;
+    }
+    
+    /* Check limit */
+    if (task->io_write_bytes_this_period + bytes > task->io_write_limit) {
+        allowed = FALSE;
+        task->io_write_throttled_count++;
+    } else {
+        task->io_write_bytes_this_period += bytes;
+    }
+    
+    task_unlock(task);
+    
+    return allowed;
+}
+
+/*
+ * Function: task_set_swap_limit
+ *
+ * Set swap usage limit for task
+ */
+kern_return_t task_set_swap_limit(task_t task, unsigned long long limit_bytes)
+{
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(task);
+    task->swap_limit = limit_bytes;
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function: task_get_swap_limit
+ *
+ * Get swap limit of task
+ */
+unsigned long long task_get_swap_limit(task_t task)
+{
+    unsigned long long limit;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_lock(task);
+    limit = task->swap_limit;
+    task_unlock(task);
+    
+    return limit;
+}
+
+/*
+ * Function: task_check_swap_limit
+ *
+ * Check if task exceeded swap limit
+ */
+boolean_t task_check_swap_limit(task_t task)
+{
+    boolean_t exceeded = FALSE;
+    
+    if (task == TASK_NULL || task->swap_limit == 0)
+        return FALSE;
+    
+    task_lock(task);
+    if (task->swap_pages * PAGE_SIZE > task->swap_limit) {
+        exceeded = TRUE;
+    }
+    task_unlock(task);
+    
+    return exceeded;
+}
+
+/*
+ * Function: task_get_container_stats
+ *
+ * Get container statistics for task
+ */
+void task_get_container_stats(task_t task, unsigned long long *cpu_usage,
+                               unsigned long long *mem_usage, 
+                               unsigned long long *io_usage)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    if (cpu_usage != NULL)
+        *cpu_usage = task->container_cpu_usage;
+    if (mem_usage != NULL)
+        *mem_usage = task->container_mem_usage;
+    if (io_usage != NULL)
+        *io_usage = task->container_io_usage;
+    task_unlock(task);
+}
+
+/*
+ * Function: task_update_container_stats
+ *
+ * Update container statistics for task
+ */
+void task_update_container_stats(task_t task, unsigned long long cpu_delta,
+                                  unsigned long long mem_delta,
+                                  unsigned long long io_delta)
+{
+    if (task == TASK_NULL)
+        return;
+    
+    task_lock(task);
+    task->container_cpu_usage += cpu_delta;
+    task->container_mem_usage += mem_delta;
+    task->container_io_usage += io_delta;
+    task_unlock(task);
+}
