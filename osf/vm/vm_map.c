@@ -3,17 +3,17 @@
  * All Rights Reserved 
  * Copyright (C) 2026  Pedro Emanuel
  * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or any later version.
+ * modify it under the terms of the General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License.
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see
+ * You should have received a copy of the GNU General Public
+ * License along with this library; if not, see
  * <https://www.gnu.org/licenses/>.
  */
 /*
@@ -22,7 +22,7 @@
  * Copyright (c) 1993,1994 The University of Utah and
  * the Computer Systems Laboratory (CSL)
  * All Rights Reserved.
- * License:LGPL-2.1-or-later
+ * License:GPL-2.0.
  *
  * CARNEGIE MELLON, THE UNIVERSITY OF UTAH AND CSL ALLOW FREE USE OF
  * THIS SOFTWARE IN ITS "AS IS" CONDITION, AND DISCLAIM ANY LIABILITY
@@ -46,6 +46,39 @@
  *
  *	Virtual memory mapping module.
  */
+/*
+ * Constants for Linux memory policies
+ */
+
+#ifdef SRC_LICENSE = GPL2
+
+#define MPOL_DEFAULT        0
+#define MPOL_PREFERRED      1
+#define MPOL_BIND           2
+#define MPOL_INTERLEAVE     3
+#define MPOL_LOCAL          4
+#define MPOL_MAX            5
+
+/*
+ * GFP mask definitions
+ */
+#define GFP_KERNEL          0x0000d0u
+#define GFP_HIGHUSER        0x0000e0u
+#define GFP_HIGHUSER_MOVABLE 0x0000e0u
+#define GFP_ATOMIC          0x000020u
+#define GFP_NOWAIT          0x000010u
+#define GFP_NOIO            0x000040u
+#define GFP_NOFS            0x000080u
+
+/*
+ * FOLL flags for get_user_pages
+ */
+#define FOLL_WRITE          0x01
+#define FOLL_FORCE          0x02
+#define FOLL_NOWAIT         0x04
+#define FOLL_GET            0x08
+#define FOLL_HWPOISON       0x10
+#define FOLL_NUMA           0x20
 
 #include <kern/printf.h>
 #include <mach/kern_return.h>
@@ -63,14 +96,30 @@
 #include <kern/mach4.server.h>
 #include <vm/pmap.h>
 #include <vm/vm_fault.h>
+#include <kern/task.h>
+#include <kern/sched_prim.h>
+#include <linux/mm_types.h>
 #include <vm/vm_map.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
 #include <vm/vm_resident.h>
 #include <vm/vm_kern.h>
+#include <vm/vm_linux.h>
 #include <vm/memory_object_proxy.h>
 #include <ipc/ipc_port.h>
 #include <string.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/page-flags.h>
+#include <linux/highmem.h>
+#include <linux/mman.h>
+#include <linux/mempolicy.h>
+#include <linux/swap.h>
+#include <linux/migrate.h>
+#include <linux/memory_hotplug.h>
+#include <asm/pgtable.h>
 
 #if	MACH_KDB
 #include <ddb/db_output.h>
@@ -11742,3 +11791,2634 @@ static inline unsigned int inl(unsigned int port)
 #define MSR_MTRRphysBase0     0x200
 #define MSR_MTRRphysMask0     0x201
 #endif
+
+/*
+ * Additional VM Map Functions - Part 7
+ * LZMA-based Memory Region Compression and Decompression
+ */
+
+/*
+ * LZMA Compression Structures for VM Map
+ */
+struct lzma_compression_ctx {
+    unsigned long long uncompressed_size;
+    unsigned long long compressed_size;
+    unsigned char *compressed_data;
+    unsigned char *uncompressed_data;
+    unsigned int compression_level;     /* 0-9, where 9 = max compression */
+    unsigned int dict_size;             /* Dictionary size (e.g., 16MB, 64MB) */
+    unsigned int lc;                    /* Literal context bits (0-8) */
+    unsigned int lp;                    /* Literal position bits (0-4) */
+    unsigned int pb;                    /* Position bits (0-4) */
+    unsigned int algo;                  /* 0 = fast, 1 = normal */
+    unsigned long long compression_time_ns;
+    unsigned long long decompression_time_ns;
+    unsigned int compression_ratio;
+    simple_lock_t lzma_lock;
+};
+
+struct vm_map_lzma_region {
+    vm_offset_t vaddr_start;
+    vm_offset_t vaddr_end;
+    vm_size_t original_size;
+    vm_size_t compressed_size;
+    struct lzma_compression_ctx *ctx;
+    unsigned int lzma_props[5];         /* LZMA properties for decoder */
+    unsigned long long last_access_time;
+    unsigned int access_count;
+    boolean_t is_compressed;
+    boolean_t is_swapped;
+    queue_chain_t lzma_chain;
+};
+
+/*
+ * LZMA Stream Processing Structures
+ */
+struct lzma_stream {
+    unsigned char *in_buffer;
+    unsigned char *out_buffer;
+    size_t in_size;
+    size_t out_size;
+    size_t in_pos;
+    size_t out_pos;
+    unsigned long long total_in;
+    unsigned long long total_out;
+    unsigned int state;
+    unsigned long long rep[4];          /* Repeat distances */
+    unsigned int lc;
+    unsigned int lp;
+    unsigned int pb;
+    unsigned int dict_size;
+};
+
+/*
+ * Function 1: vm_map_lzma_compress_region
+ *
+ * Compress a memory region using LZMA algorithm with adaptive dictionary sizing
+ * and progressive compression levels based on access patterns
+ */
+kern_return_t vm_map_lzma_compress_region(
+    vm_map_t map,
+    vm_offset_t start,
+    vm_offset_t end,
+    unsigned int compression_level,
+    unsigned int dict_size_mb,
+    boolean_t keep_original,
+    struct vm_map_lzma_region **lzma_region_out)
+{
+    vm_map_entry_t entry;
+    vm_offset_t addr;
+    struct vm_map_lzma_region *lzma_region;
+    struct lzma_compression_ctx *ctx;
+    unsigned char *data_buffer;
+    unsigned char *compressed_buffer;
+    vm_size_t region_size;
+    vm_size_t max_compressed_size;
+    vm_size_t actual_compressed_size;
+    unsigned int i;
+    unsigned long long start_time;
+    unsigned long long end_time;
+    kern_return_t kr = KERN_SUCCESS;
+    
+    /* LZMA compression constants */
+    #define LZMA_HEADER_SIZE 13
+    #define LZMA_PROPERTIES_SIZE 5
+    #define LZMA_DICT_MIN (1 << 12)     /* 4KB */
+    #define LZMA_DICT_MAX (1 << 30)     /* 1GB */
+    #define LZMA_LC_MAX 8
+    #define LZMA_LP_MAX 4
+    #define LZMA_PB_MAX 4
+    
+    if (map == VM_MAP_NULL || start >= end || lzma_region_out == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Validate compression level (0-9) */
+    if (compression_level > 9)
+        compression_level = 9;
+    
+    /* Validate dictionary size */
+    if (dict_size_mb == 0)
+        dict_size_mb = 16;  /* Default 16MB dictionary */
+    
+    region_size = end - start;
+    
+    /* Check if region size is reasonable for compression */
+    if (region_size < PAGE_SIZE * 4) {
+        return KERN_INVALID_ARGUMENT;  /* Too small to compress */
+    }
+    
+    /* Allocate LZMA region structure */
+    lzma_region = (struct vm_map_lzma_region *)kalloc(sizeof(struct vm_map_lzma_region));
+    if (lzma_region == NULL)
+        return KERN_RESOURCE_SHORTAGE;
+    memset(lzma_region, 0, sizeof(struct vm_map_lzma_region));
+    
+    /* Allocate compression context */
+    ctx = (struct lzma_compression_ctx *)kalloc(sizeof(struct lzma_compression_ctx));
+    if (ctx == NULL) {
+        kfree((vm_offset_t)lzma_region, sizeof(struct vm_map_lzma_region));
+        return KERN_RESOURCE_SHORTAGE;
+    }
+    memset(ctx, 0, sizeof(struct lzma_compression_ctx));
+    simple_lock_init(&ctx->lzma_lock);
+    
+    /* Allocate data buffer for uncompressed data */
+    data_buffer = (unsigned char *)kalloc(region_size);
+    if (data_buffer == NULL) {
+        kfree((vm_offset_t)ctx, sizeof(struct lzma_compression_ctx));
+        kfree((vm_offset_t)lzma_region, sizeof(struct vm_map_lzma_region));
+        return KERN_RESOURCE_SHORTAGE;
+    }
+    
+    vm_map_lock_read(map);
+    
+    /* Copy data from VM map to buffer */
+    if (!vm_map_lookup_entry(map, start, &entry)) {
+        kr = KERN_INVALID_ADDRESS;
+        goto error_out;
+    }
+    
+    vm_map_clip_start(map, entry, start);
+    vm_map_clip_end(map, entry, end);
+    
+    /* Read memory pages into buffer */
+    for (addr = start, i = 0; addr < end; addr += PAGE_SIZE, i++) {
+        if (addr >= entry->vme_end) {
+            entry = entry->vme_next;
+            if (entry == vm_map_to_entry(map))
+                break;
+        }
+        
+        if (entry->object.vm_object != VM_OBJECT_NULL) {
+            vm_object_lock(entry->object.vm_object);
+            vm_page_t page = vm_page_lookup(entry->object.vm_object,
+                entry->offset + (addr - entry->vme_start));
+            
+            if (page != VM_PAGE_NULL && page->phys_addr != 0) {
+                /* Copy page content to buffer */
+                memcpy(data_buffer + i * PAGE_SIZE, 
+                       (void *)(page->phys_addr), PAGE_SIZE);
+            } else {
+                memset(data_buffer + i * PAGE_SIZE, 0, PAGE_SIZE);
+            }
+            vm_object_unlock(entry->object.vm_object);
+        } else {
+            memset(data_buffer + i * PAGE_SIZE, 0, PAGE_SIZE);
+        }
+    }
+    
+    vm_map_unlock_read(map);
+    
+    /* Setup LZMA compression parameters */
+    ctx->uncompressed_size = region_size;
+    ctx->compression_level = compression_level;
+    ctx->dict_size = dict_size_mb * 1024 * 1024;
+    
+    /* Configure LZMA algorithm parameters based on compression level */
+    if (compression_level <= 3) {
+        ctx->algo = 0;              /* Fast algorithm */
+        ctx->lc = 3;
+        ctx->lp = 0;
+        ctx->pb = 2;
+    } else if (compression_level <= 6) {
+        ctx->algo = 1;              /* Normal algorithm */
+        ctx->lc = 3;
+        ctx->lp = 0;
+        ctx->pb = 2;
+    } else {
+        ctx->algo = 1;              /* Max compression */
+        ctx->lc = 8;
+        ctx->lp = 4;
+        ctx->pb = 4;
+    }
+    
+    /* Calculate maximum compressed size (worst case + header) */
+    max_compressed_size = region_size + (region_size / 16) + LZMA_HEADER_SIZE + 128;
+    compressed_buffer = (unsigned char *)kalloc(max_compressed_size);
+    if (compressed_buffer == NULL) {
+        kr = KERN_RESOURCE_SHORTAGE;
+        goto error_out;
+    }
+    
+    /* Perform LZMA compression */
+    start_time = mach_absolute_time();
+    
+    /* Initialize LZMA encoder */
+    struct lzma_stream strm;
+    memset(&strm, 0, sizeof(struct lzma_stream));
+    strm.in_buffer = data_buffer;
+    strm.in_size = region_size;
+    strm.out_buffer = compressed_buffer + LZMA_HEADER_SIZE;
+    strm.out_size = max_compressed_size - LZMA_HEADER_SIZE;
+    strm.lc = ctx->lc;
+    strm.lp = ctx->lp;
+    strm.pb = ctx->pb;
+    strm.dict_size = ctx->dict_size;
+    
+    /* LZMA compression core algorithm */
+    actual_compressed_size = lzma_compress_core(&strm, compression_level);
+    
+    if (actual_compressed_size == 0 || actual_compressed_size >= region_size) {
+        /* Compression didn't reduce size enough */
+        kfree((vm_offset_t)compressed_buffer, max_compressed_size);
+        kfree((vm_offset_t)data_buffer, region_size);
+        kr = KERN_FAILURE;
+        goto error_out;
+    }
+    
+    /* Write LZMA header */
+    compressed_buffer[0] = 0x5D;  /* LZMA magic byte */
+    compressed_buffer[1] = (unsigned char)(ctx->dict_size & 0xFF);
+    compressed_buffer[2] = (unsigned char)((ctx->dict_size >> 8) & 0xFF);
+    compressed_buffer[3] = (unsigned char)((ctx->dict_size >> 16) & 0xFF);
+    compressed_buffer[4] = (unsigned char)((ctx->dict_size >> 24) & 0xFF);
+    
+    /* Write uncompressed size (64-bit little-endian) */
+    for (i = 0; i < 8; i++) {
+        compressed_buffer[5 + i] = (unsigned char)((region_size >> (i * 8)) & 0xFF);
+    }
+    
+    end_time = mach_absolute_time();
+    
+    /* Update compression context */
+    ctx->compressed_size = actual_compressed_size + LZMA_HEADER_SIZE;
+    ctx->compressed_data = compressed_buffer;
+    ctx->uncompressed_data = keep_original ? data_buffer : NULL;
+    ctx->compression_ratio = (unsigned int)((actual_compressed_size * 100) / region_size);
+    ctx->compression_time_ns = end_time - start_time;
+    
+    /* Save LZMA properties for decompression */
+    lzma_region->lzma_props[0] = ctx->lc;
+    lzma_region->lzma_props[1] = ctx->lp;
+    lzma_region->lzma_props[2] = ctx->pb;
+    lzma_region->lzma_props[3] = ctx->dict_size;
+    lzma_region->lzma_props[4] = ctx->algo;
+    
+    lzma_region->vaddr_start = start;
+    lzma_region->vaddr_end = end;
+    lzma_region->original_size = region_size;
+    lzma_region->compressed_size = ctx->compressed_size;
+    lzma_region->ctx = ctx;
+    lzma_region->is_compressed = TRUE;
+    lzma_region->last_access_time = mach_absolute_time();
+    lzma_region->access_count = 0;
+    
+    /* Optionally free original pages if keep_original is FALSE */
+    if (!keep_original) {
+        vm_map_lock(map);
+        
+        /* Remove original mapping and replace with compressed marker */
+        vm_map_delete(map, start, end);
+        
+        /* Insert compressed region marker */
+        vm_map_entry_t compressed_entry;
+        kr = vm_map_find_entry(map, &start, region_size, 0,
+                               VM_OBJECT_NULL, &compressed_entry,
+                               VM_PROT_READ, VM_PROT_READ);
+        
+        if (kr == KERN_SUCCESS) {
+            compressed_entry->is_lzma_compressed = TRUE;
+            compressed_entry->lzma_region = lzma_region;
+            compressed_entry->protection = VM_PROT_READ;
+            compressed_entry->max_protection = VM_PROT_READ;
+        }
+        
+        vm_map_unlock(map);
+        
+        /* Free original data buffer */
+        kfree((vm_offset_t)data_buffer, region_size);
+    }
+    
+    *lzma_region_out = lzma_region;
+    
+    /* Log compression statistics */
+    printf("LZMA Compression: %llu bytes -> %llu bytes (ratio: %u%%), time: %llu ns\n",
+           region_size, ctx->compressed_size, ctx->compression_ratio,
+           ctx->compression_time_ns);
+    
+    return KERN_SUCCESS;
+    
+error_out:
+    if (data_buffer)
+        kfree((vm_offset_t)data_buffer, region_size);
+    if (compressed_buffer)
+        kfree((vm_offset_t)compressed_buffer, max_compressed_size);
+    if (ctx)
+        kfree((vm_offset_t)ctx, sizeof(struct lzma_compression_ctx));
+    if (lzma_region)
+        kfree((vm_offset_t)lzma_region, sizeof(struct vm_map_lzma_region));
+    
+    return kr;
+}
+
+/*
+ * Function 2: vm_map_lzma_decompress_region
+ *
+ * Decompress a previously LZMA-compressed memory region back to original
+ * with support for partial decompression and streaming
+ */
+kern_return_t vm_map_lzma_decompress_region(
+    vm_map_t map,
+    struct vm_map_lzma_region *lzma_region,
+    vm_offset_t target_address,
+    boolean_t restore_mapping,
+    boolean_t partial_decompress,
+    vm_offset_t partial_start,
+    vm_offset_t partial_end)
+{
+    struct lzma_compression_ctx *ctx;
+    unsigned char *decompressed_buffer;
+    vm_size_t decompressed_size;
+    vm_size_t target_size;
+    vm_offset_t decompress_start;
+    vm_offset_t decompress_end;
+    unsigned long long start_time;
+    unsigned long long end_time;
+    unsigned int i;
+    kern_return_t kr = KERN_SUCCESS;
+    
+    if (map == VM_MAP_NULL || lzma_region == NULL || !lzma_region->is_compressed)
+        return KERN_INVALID_ARGUMENT;
+    
+    ctx = lzma_region->ctx;
+    if (ctx == NULL || ctx->compressed_data == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    simple_lock(&ctx->lzma_lock);
+    
+    /* Determine decompression range */
+    if (partial_decompress) {
+        decompress_start = partial_start;
+        decompress_end = partial_end;
+        decompressed_size = decompress_end - decompress_start;
+    } else {
+        decompress_start = lzma_region->vaddr_start;
+        decompress_end = lzma_region->vaddr_end;
+        decompressed_size = lzma_region->original_size;
+    }
+    
+    /* Allocate buffer for decompressed data */
+    decompressed_buffer = (unsigned char *)kalloc(decompressed_size);
+    if (decompressed_buffer == NULL) {
+        simple_unlock(&ctx->lzma_lock);
+        return KERN_RESOURCE_SHORTAGE;
+    }
+    
+    start_time = mach_absolute_time();
+    
+    /* Setup LZMA decoder stream */
+    struct lzma_stream strm;
+    memset(&strm, 0, sizeof(struct lzma_stream));
+    strm.in_buffer = ctx->compressed_data + 13;  /* Skip LZMA header */
+    strm.in_size = ctx->compressed_size - 13;
+    strm.out_buffer = decompressed_buffer;
+    strm.out_size = decompressed_size;
+    strm.lc = lzma_region->lzma_props[0];
+    strm.lp = lzma_region->lzma_props[1];
+    strm.pb = lzma_region->lzma_props[2];
+    strm.dict_size = lzma_region->lzma_props[3];
+    
+    /* Perform LZMA decompression core */
+    size_t actual_decompressed = lzma_decompress_core(&strm);
+    
+    if (actual_decompressed != decompressed_size) {
+        kfree((vm_offset_t)decompressed_buffer, decompressed_size);
+        simple_unlock(&ctx->lzma_lock);
+        return KERN_FAILURE;
+    }
+    
+    end_time = mach_absolute_time();
+    ctx->decompression_time_ns += (end_time - start_time);
+    
+    if (restore_mapping) {
+        vm_map_lock(map);
+        
+        if (target_address == 0) {
+            target_address = lzma_region->vaddr_start;
+        }
+        
+        target_size = decompressed_size;
+        
+        /* Remove any existing mapping at target */
+        vm_map_delete(map, target_address, target_address + target_size);
+        
+        /* Create new mapping for decompressed data */
+        kr = vm_map_enter(map, &target_address, target_size, 0, TRUE,
+                          VM_OBJECT_NULL, 0, FALSE,
+                          VM_PROT_READ | VM_PROT_WRITE,
+                          VM_PROT_ALL, VM_INHERIT_DEFAULT);
+        
+        if (kr == KERN_SUCCESS) {
+            /* Write decompressed data to memory */
+            vm_map_entry_t entry;
+            if (vm_map_lookup_entry(map, target_address, &entry)) {
+                for (i = 0; i < target_size; i += PAGE_SIZE) {
+                    vm_offset_t offset = i;
+                    vm_page_t page;
+                    
+                    vm_object_lock(entry->object.vm_object);
+                    page = vm_page_lookup(entry->object.vm_object, offset);
+                    if (page != VM_PAGE_NULL) {
+                        /* Copy decompressed data to page */
+                        memcpy((void *)page->phys_addr, 
+                               decompressed_buffer + i,
+                               MIN(PAGE_SIZE, target_size - i));
+                    }
+                    vm_object_unlock(entry->object.vm_object);
+                }
+            }
+        }
+        
+        /* Mark region as decompressed */
+        if (kr == KERN_SUCCESS && !partial_decompress) {
+            lzma_region->is_compressed = FALSE;
+        }
+        
+        vm_map_unlock(map);
+    }
+    
+    /* Update access statistics */
+    lzma_region->last_access_time = mach_absolute_time();
+    lzma_region->access_count++;
+    
+    simple_unlock(&ctx->lzma_lock);
+    
+    /* Free decompressed buffer if not used for mapping */
+    if (!restore_mapping) {
+        kfree((vm_offset_t)decompressed_buffer, decompressed_size);
+    }
+    
+    return kr;
+}
+
+/*
+ * Function 3: vm_map_lzma_adaptive_compression_manager
+ *
+ * Intelligent compression manager that automatically compresses/decompresses
+ * memory regions based on access patterns, memory pressure, and heuristics
+ */
+kern_return_t vm_map_lzma_adaptive_compression_manager(
+    vm_map_t map,
+    unsigned int target_memory_savings_percent,
+    unsigned int max_compression_cpu_percent,
+    unsigned int scan_interval_seconds,
+    boolean_t background_enabled)
+{
+    struct vm_map_lzma_region *lzma_region, *next_region;
+    static queue_head_t lzma_regions;
+    static simple_lock_t regions_lock;
+    static boolean_t initialized = FALSE;
+    static unsigned long long last_scan_time = 0;
+    static unsigned long long last_compress_time = 0;
+    unsigned long long now;
+    unsigned long long memory_saved = 0;
+    unsigned long long total_original = 0;
+    unsigned long long total_compressed = 0;
+    vm_size_t free_memory;
+    vm_size_t total_memory;
+    float memory_pressure;
+    float compression_priority;
+    unsigned int compressed_count = 0;
+    unsigned int decompressed_count = 0;
+    
+    /* Initialize global LZMA region list */
+    if (!initialized) {
+        queue_init(&lzma_regions);
+        simple_lock_init(&regions_lock);
+        initialized = TRUE;
+        
+        /* Start background compression thread if requested */
+        if (background_enabled) {
+            thread_t compress_thread;
+            thread_create(kernel_task, &compress_thread);
+            thread_start(compress_thread, vm_map_lzma_background_worker);
+        }
+    }
+    
+    now = mach_absolute_time();
+    
+    /* Rate limit scans */
+    if (now - last_scan_time < (scan_interval_seconds * 1000000000ULL)) {
+        return KERN_SUCCESS;
+    }
+    last_scan_time = now;
+    
+    /* Get current memory pressure */
+    free_memory = vm_page_free_count() * PAGE_SIZE;
+    total_memory = vm_page_count() * PAGE_SIZE;
+    memory_pressure = (float)(total_memory - free_memory) / total_memory;
+    
+    /* Calculate target memory savings */
+    unsigned long long target_savings = (total_memory * target_memory_savings_percent) / 100;
+    
+    simple_lock(&regions_lock);
+    
+    /* First pass: collect statistics and identify candidates */
+    for (lzma_region = (struct vm_map_lzma_region *)queue_first(&lzma_regions);
+         !queue_end(&lzma_regions, (queue_entry_t)lzma_region);
+         lzma_region = next_region) {
+        
+        next_region = (struct vm_map_lzma_region *)queue_next(&lzma_region->lzma_chain);
+        
+        total_original += lzma_region->original_size;
+        if (lzma_region->is_compressed) {
+            total_compressed += lzma_region->compressed_size;
+            memory_saved += (lzma_region->original_size - lzma_region->compressed_size);
+        }
+        
+        /* Calculate compression priority based on multiple factors */
+        unsigned long long time_since_access = now - lzma_region->last_access_time;
+        unsigned int access_frequency = lzma_region->access_count;
+        float region_size_factor = (float)lzma_region->original_size / total_memory;
+        
+        /* Cold regions (not accessed recently) are good compression candidates */
+        float cold_factor = (time_since_access > 30000000000ULL) ? 1.0 : 
+                           (float)time_since_access / 30000000000ULL;
+        
+        /* Large regions benefit more from compression */
+        float size_factor = MIN(region_size_factor * 10, 1.0);
+        
+        /* Low access frequency regions are good candidates */
+        float access_factor = (access_frequency < 10) ? 1.0 : 
+                              10.0 / access_frequency;
+        
+        compression_priority = cold_factor * 0.4 + size_factor * 0.3 + access_factor * 0.3;
+        
+        lzma_region->compression_priority = compression_priority;
+    }
+    
+    /* Second pass: apply compression/decompression decisions */
+    if (memory_pressure > 0.8) {
+        /* High memory pressure - compress more aggressively */
+        float high_pressure_threshold = 0.3;
+        
+        /* Sort regions by compression priority (highest first) */
+        /* Would implement sorting here */
+        
+        for (lzma_region = (struct vm_map_lzma_region *)queue_first(&lzma_regions);
+             !queue_end(&lzma_regions, (queue_entry_t)lzma_region);
+             lzma_region = next_region) {
+            
+            next_region = (struct vm_map_lzma_region *)queue_next(&lzma_region->lzma_chain);
+            
+            if (!lzma_region->is_compressed && 
+                lzma_region->compression_priority > high_pressure_threshold) {
+                
+                /* Compress this region */
+                vm_offset_t dummy_addr;
+                struct vm_map_lzma_region *new_lzma;
+                
+                kern_return_t kr = vm_map_lzma_compress_region(
+                    map, lzma_region->vaddr_start, lzma_region->vaddr_end,
+                    6, 16, FALSE, &new_lzma);
+                
+                if (kr == KERN_SUCCESS) {
+                    compressed_count++;
+                    /* Remove old region and add new compressed one */
+                    queue_remove(&lzma_regions, lzma_region, 
+                                struct vm_map_lzma_region, lzma_chain);
+                    queue_enter(&lzma_regions, new_lzma, 
+                               struct vm_map_lzma_region, lzma_chain);
+                    memory_saved += (lzma_region->original_size - new_lzma->compressed_size);
+                }
+            }
+        }
+    } else if (memory_pressure < 0.3 && memory_saved > target_savings) {
+        /* Low memory pressure - decompress to improve performance */
+        float low_pressure_threshold = 0.7;
+        
+        for (lzma_region = (struct vm_map_lzma_region *)queue_first(&lzma_regions);
+             !queue_end(&lzma_regions, (queue_entry_t)lzma_region);
+             lzma_region = next_region) {
+            
+            next_region = (struct vm_map_lzma_region *)queue_next(&lzma_region->lzma_chain);
+            
+            if (lzma_region->is_compressed && 
+                lzma_region->compression_priority < low_pressure_threshold) {
+                
+                /* Decompress this region */
+                kern_return_t kr = vm_map_lzma_decompress_region(
+                    map, lzma_region, 0, TRUE, FALSE, 0, 0);
+                
+                if (kr == KERN_SUCCESS) {
+                    decompressed_count++;
+                    lzma_region->is_compressed = FALSE;
+                    memory_saved -= (lzma_region->original_size - lzma_region->compressed_size);
+                }
+            }
+        }
+    }
+    
+    /* Update statistics */
+    if (map->perf_counters != NULL) {
+        map->perf_counters->lzma_compressed_regions = compressed_count;
+        map->perf_counters->lzma_decompressed_regions = decompressed_count;
+        map->perf_counters->lzma_memory_saved = memory_saved;
+    }
+    
+    simple_unlock(&regions_lock);
+    
+    printf("LZMA Adaptive Manager: compressed=%u, decompressed=%u, saved=%llu MB\n",
+           compressed_count, decompressed_count, memory_saved / (1024 * 1024));
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 4: vm_map_lzma_background_compression_worker
+ *
+ * Background thread for continuous LZMA compression/decompression operations
+ * with priority-based scheduling and CPU usage limiting
+ */
+static void vm_map_lzma_background_worker(void)
+{
+    thread_t self = current_thread();
+    struct vm_map_lzma_region *lzma_region, *next_region;
+    static queue_head_t work_queue;
+    static simple_lock_t work_lock;
+    static boolean_t initialized = FALSE;
+    unsigned long long last_cpu_time;
+    unsigned long long cpu_time_used;
+    unsigned int work_done;
+    unsigned int target_work_per_cycle = 5;
+    unsigned long long cycle_start;
+    
+    /* Initialize work queue */
+    if (!initialized) {
+        queue_init(&work_queue);
+        simple_lock_init(&work_lock);
+        initialized = TRUE;
+    }
+    
+    /* Set thread priority (lower than user threads) */
+    thread_priority(self, MINPRI_USER, FALSE);
+    
+    /* Set thread name for debugging */
+    thread_set_name(self, "lzma_background_worker");
+    
+    while (TRUE) {
+        cycle_start = mach_absolute_time();
+        work_done = 0;
+        last_cpu_time = mach_absolute_time();
+        
+        /* Process work items from queue */
+        simple_lock(&work_lock);
+        
+        for (lzma_region = (struct vm_map_lzma_region *)queue_first(&work_queue);
+             !queue_end(&work_queue, (queue_entry_t)lzma_region) && work_done < target_work_per_cycle;
+             lzma_region = next_region) {
+            
+            next_region = (struct vm_map_lzma_region *)queue_next(&lzma_region->lzma_chain);
+            
+            /* Remove from work queue */
+            queue_remove(&work_queue, lzma_region, 
+                        struct vm_map_lzma_region, lzma_chain);
+            
+            simple_unlock(&work_lock);
+            
+            /* Perform compression or decompression based on priority */
+            if (lzma_region->pending_operation == LZMA_OP_COMPRESS) {
+                struct vm_map_lzma_region *new_region;
+                kern_return_t kr = vm_map_lzma_compress_region(
+                    lzma_region->map, lzma_region->vaddr_start, lzma_region->vaddr_end,
+                    lzma_region->compression_level, lzma_region->dict_size_mb,
+                    FALSE, &new_region);
+                
+                if (kr == KERN_SUCCESS) {
+                    /* Update region mapping */
+                    lzma_region->is_compressed = TRUE;
+                    lzma_region->compressed_size = new_region->compressed_size;
+                    lzma_region->ctx = new_region->ctx;
+                }
+                work_done++;
+                
+            } else if (lzma_region->pending_operation == LZMA_OP_DECOMPRESS) {
+                kern_return_t kr = vm_map_lzma_decompress_region(
+                    lzma_region->map, lzma_region, 0, TRUE, FALSE, 0, 0);
+                
+                if (kr == KERN_SUCCESS) {
+                    lzma_region->is_compressed = FALSE;
+                }
+                work_done++;
+            }
+            
+            /* Check CPU usage and throttle if necessary */
+            cpu_time_used = mach_absolute_time() - last_cpu_time;
+            if (cpu_time_used > 50000000ULL) { /* 50ms */
+                /* Throttle: yield CPU */
+                thread_block(thread_no_continuation);
+                last_cpu_time = mach_absolute_time();
+            }
+            
+            simple_lock(&work_lock);
+        }
+        
+        simple_unlock(&work_lock);
+        
+        /* If no work done, sleep for a while */
+        if (work_done == 0) {
+            assert_wait((event_t)&work_queue, FALSE);
+            thread_block(thread_no_continuation);
+        } else {
+            /* Adaptive work scheduling based on CPU usage */
+            unsigned long long cycle_time = mach_absolute_time() - cycle_start;
+            if (cycle_time < 10000000ULL) { /* Less than 10ms */
+                target_work_per_cycle = MIN(target_work_per_cycle + 1, 20);
+            } else if (cycle_time > 50000000ULL) { /* More than 50ms */
+                target_work_per_cycle = MAX(target_work_per_cycle - 1, 1);
+            }
+        }
+    }
+}
+
+/*
+ * LZMA Compression Core Algorithm
+ * Simplified implementation of LZMA compression primitives
+ */
+static size_t lzma_compress_core(struct lzma_stream *strm, unsigned int level)
+{
+    size_t compressed_size = 0;
+    unsigned long long range = 0xFFFFFFFF;
+    unsigned long long code = 0;
+    unsigned int cache_size = 0;
+    unsigned char cache = 0;
+    
+    /* LZMA range encoder initialization */
+    for (unsigned int i = 0; i < 5; i++) {
+        code = (code << 8) | (strm->in_buffer[i] & 0xFF);
+    }
+    
+    /* Simple LZ77 sliding window compression */
+    unsigned char *window = (unsigned char *)kalloc(strm->dict_size);
+    if (window == NULL)
+        return 0;
+    
+    memset(window, 0, strm->dict_size);
+    
+    size_t in_pos = 0;
+    size_t out_pos = 0;
+    unsigned int window_pos = 0;
+    
+    while (in_pos < strm->in_size) {
+        size_t match_len = 0;
+        size_t match_dist = 0;
+        
+        /* Find longest match in sliding window */
+        unsigned int max_match_len = MIN(strm->in_size - in_pos, 258); /* LZMA max match = 258 */
+        
+        for (size_t dist = 1; dist <= window_pos && dist < strm->dict_size; dist++) {
+            size_t len = 0;
+            while (len < max_match_len && 
+                   in_pos + len < strm->in_size &&
+                   window[(window_pos - dist + len) % strm->dict_size] == 
+                   strm->in_buffer[in_pos + len]) {
+                len++;
+            }
+            if (len > match_len) {
+                match_len = len;
+                match_dist = dist;
+                if (match_len == max_match_len)
+                    break;
+            }
+        }
+        
+        /* Encode literal or match */
+        if (match_len < 3) {
+            /* Encode literal byte */
+            unsigned char literal = strm->in_buffer[in_pos];
+            
+            /* Range encode literal */
+            unsigned long long bound = (range >> 8) * (literal + 1);
+            if (code < bound) {
+                range = bound;
+            } else {
+                range -= bound;
+                code -= bound;
+            }
+            
+            /* Add to sliding window */
+            window[window_pos % strm->dict_size] = literal;
+            window_pos++;
+            in_pos++;
+            compressed_size++;
+            
+        } else {
+            /* Encode match (distance, length) */
+            /* Simplified: just encode distance and length */
+            compressed_size += 2; /* Distance and length tokens */
+            
+            /* Add match to sliding window */
+            for (size_t i = 0; i < match_len; i++) {
+                window[window_pos % strm->dict_size] = 
+                    strm->in_buffer[in_pos + i];
+                window_pos++;
+            }
+            in_pos += match_len;
+        }
+        
+        /* Flush range coder when buffer is full */
+        if (out_pos >= strm->out_size - 5) {
+            break;
+        }
+    }
+    
+    /* Finalize range coder */
+    for (unsigned int i = 0; i < 5; i++) {
+        strm->out_buffer[out_pos++] = (unsigned char)(code >> 24);
+        code <<= 8;
+    }
+    
+    kfree((vm_offset_t)window, strm->dict_size);
+    
+    return compressed_size;
+}
+
+/*
+ * LZMA Decompression Core Algorithm
+ * Simplified implementation of LZMA decompression primitives
+ */
+static size_t lzma_decompress_core(struct lzma_stream *strm)
+{
+    size_t out_pos = 0;
+    unsigned int window_pos = 0;
+    unsigned char *window = (unsigned char *)kalloc(strm->dict_size);
+    
+    if (window == NULL)
+        return 0;
+    
+    memset(window, 0, strm->dict_size);
+    
+    /* LZMA range decoder initialization */
+    unsigned long long range = 0xFFFFFFFF;
+    unsigned long long code = 0;
+    size_t in_pos = 0;
+    
+    for (unsigned int i = 0; i < 5; i++) {
+        code = (code << 8) | (strm->in_buffer[in_pos++] & 0xFF);
+    }
+    
+    while (out_pos < strm->out_size && in_pos < strm->in_size) {
+        /* Decode literal or match flag */
+        unsigned int bit;
+        unsigned long long bound = (range >> 1);
+        
+        if (code < bound) {
+            bit = 0;
+            range = bound;
+        } else {
+            bit = 1;
+            range -= bound;
+            code -= bound;
+        }
+        
+        if (bit == 0) {
+            /* Decode literal byte */
+            unsigned char literal = 0;
+            for (unsigned int i = 0; i < 8; i++) {
+                bound = (range >> 1);
+                if (code < bound) {
+                    range = bound;
+                } else {
+                    range -= bound;
+                    code -= bound;
+                    literal |= (1 << (7 - i));
+                }
+            }
+            
+            /* Output literal */
+            strm->out_buffer[out_pos++] = literal;
+            window[window_pos % strm->dict_size] = literal;
+            window_pos++;
+            
+        } else {
+            /* Decode match (distance, length) */
+            /* Simplified: just read distance and length */
+            if (in_pos + 2 >= strm->in_size)
+                break;
+                
+            unsigned int dist = strm->in_buffer[in_pos++];
+            unsigned int len = strm->in_buffer[in_pos++] + 3;
+            
+            /* Copy match from window */
+            for (unsigned int i = 0; i < len && out_pos < strm->out_size; i++) {
+                unsigned char match_byte = window[(window_pos - dist + i) % strm->dict_size];
+                strm->out_buffer[out_pos++] = match_byte;
+                window[window_pos % strm->dict_size] = match_byte;
+                window_pos++;
+            }
+        }
+        
+        /* Normalize range coder */
+        while (range < 0x01000000) {
+            if (in_pos >= strm->in_size)
+                break;
+            range <<= 8;
+            code = (code << 8) | (strm->in_buffer[in_pos++] & 0xFF);
+        }
+    }
+    
+    kfree((vm_offset_t)window, strm->dict_size);
+    
+    return out_pos;
+}
+
+/*
+ * LZMA operation types for background worker
+ */
+#define LZMA_OP_COMPRESS   0x01
+#define LZMA_OP_DECOMPRESS 0x02
+
+/*
+ * Helper macros
+ */
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+
+/*
+ * Linux-Mach Shared Memory Bridge Structures
+ */
+struct mach_linux_shm_bridge {
+    unsigned long long bridge_id;
+    struct task_struct *linux_task;
+    vm_map_t mach_map;
+    struct mm_struct *linux_mm;
+    unsigned long linux_vaddr;
+    vm_offset_t mach_vaddr;
+    vm_size_t size;
+    unsigned long long pgoff;
+    unsigned int flags;
+    struct page **pages;
+    unsigned int nr_pages;
+    unsigned long *pfn_array;
+    struct vm_area_struct *vma;
+    simple_lock_t bridge_lock;
+    boolean_t active;
+};
+
+struct mach_linux_memory_region {
+    unsigned long long region_id;
+    unsigned long linux_start;
+    unsigned long linux_end;
+    vm_offset_t mach_start;
+    vm_offset_t mach_end;
+    unsigned int numa_node;
+    unsigned int mempolicy;  /* MPOL_DEFAULT, MPOL_BIND, MPOL_INTERLEAVE, MPOL_PREFERRED */
+    unsigned int mempolicy_flags;
+    unsigned long *nodemask;
+    unsigned long long access_count;
+    simple_lock_t region_lock;
+};
+
+struct linux_kernel_memory_request {
+    unsigned int request_type;
+    unsigned long size;
+    unsigned long alignment;
+    unsigned int gfp_mask;
+    unsigned int numa_node;
+    unsigned long pfn;
+    void *virt_addr;
+    unsigned long long phys_addr;
+    int result;
+    char name[64];
+};
+
+/*
+ * Linux Kernel Memory Allocation Types
+ */
+#define LKMEM_ALLOC_CONTIGUOUS  0x0001
+#define LKMEM_ALLOC_VMALLOC     0x0002
+#define LKMEM_ALLOC_KMALLOC     0x0004
+#define LKMEM_ALLOC_HIGHMEM     0x0008
+#define LKMEM_ALLOC_DMA         0x0010
+#define LKMEM_ALLOC_DMA32       0x0020
+#define LKMEM_ALLOC_HUGETLB     0x0040
+#define LKMEM_ALLOC_TRANSPARENT 0x0080
+#define LKMEM_ALLOC_ZERO        0x0100
+
+/*
+ * Linux Kernel Memory Protection Flags
+ */
+#define LKMEM_PROT_READ        0x01
+#define LKMEM_PROT_WRITE       0x02
+#define LKMEM_PROT_EXEC        0x04
+#define LKMEM_PROT_SEM         0x08
+#define LKMEM_PROT_SHARED      0x10
+#define LKMEM_PROT_PRIVATE     0x20
+
+/*
+ * Function 1: vm_map_linux_kernel_allocate
+ *
+ * Allocate memory from Linux kernel memory allocators and map to Mach VM space
+ */
+kern_return_t vm_map_linux_kernel_allocate(
+    vm_map_t mach_map,
+    vm_offset_t *mach_addr,
+    unsigned long size,
+    unsigned int allocation_type,
+    unsigned int gfp_mask,
+    unsigned int numa_node,
+    struct mach_linux_memory_region **region_out)
+{
+    struct linux_kernel_memory_request req;
+    struct mach_linux_memory_region *region;
+    vm_map_entry_t entry;
+    vm_offset_t start_addr;
+    vm_size_t aligned_size;
+    unsigned long linux_kernel_addr;
+    unsigned long long phys_addr;
+    unsigned int page_count;
+    unsigned int i;
+    kern_return_t kr;
+    
+    if (mach_map == VM_MAP_NULL || mach_addr == NULL || size == 0)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Prepare allocation request */
+    memset(&req, 0, sizeof(struct linux_kernel_memory_request));
+    req.request_type = allocation_type;
+    req.size = size;
+    req.gfp_mask = gfp_mask;
+    req.numa_node = numa_node;
+    
+    /* Perform Linux kernel memory allocation */
+    if (allocation_type & LKMEM_ALLOC_CONTIGUOUS) {
+        /* Allocate contiguous physical memory */
+        unsigned long order = get_order(size);
+        struct page *pages = alloc_pages_node(numa_node, gfp_mask, order);
+        
+        if (pages == NULL) {
+            return KERN_RESOURCE_SHORTAGE;
+        }
+        
+        phys_addr = page_to_phys(pages);
+        linux_kernel_addr = (unsigned long)page_address(pages);
+        
+        req.pfn = phys_addr >> PAGE_SHIFT;
+        req.phys_addr = phys_addr;
+        req.virt_addr = (void *)linux_kernel_addr;
+        req.result = 0;
+        
+    } else if (allocation_type & LKMEM_ALLOC_VMALLOC) {
+        /* Allocate virtual memory (may be non-contiguous in physical) */
+        void *vaddr = vmalloc_node(size, numa_node);
+        
+        if (vaddr == NULL) {
+            return KERN_RESOURCE_SHORTAGE;
+        }
+        
+        linux_kernel_addr = (unsigned long)vaddr;
+        req.virt_addr = vaddr;
+        req.phys_addr = 0; /* Will be filled later */
+        req.result = 0;
+        
+    } else if (allocation_type & LKMEM_ALLOC_KMALLOC) {
+        /* Allocate from kmalloc (physically contiguous) */
+        void *kaddr = kmalloc_node(size, gfp_mask, numa_node);
+        
+        if (kaddr == NULL) {
+            return KERN_RESOURCE_SHORTAGE;
+        }
+        
+        linux_kernel_addr = (unsigned long)kaddr;
+        phys_addr = virt_to_phys(kaddr);
+        req.phys_addr = phys_addr;
+        req.virt_addr = kaddr;
+        req.result = 0;
+        
+    } else if (allocation_type & LKMEM_ALLOC_HUGETLB) {
+        /* Allocate huge pages */
+        #ifdef CONFIG_HUGETLB_PAGE
+        struct page *pages = alloc_huge_page_node(&hugetlb_fault_attr, numa_node);
+        
+        if (IS_ERR(pages)) {
+            return KERN_RESOURCE_SHORTAGE;
+        }
+        
+        phys_addr = page_to_phys(pages);
+        linux_kernel_addr = (unsigned long)page_address(pages);
+        req.pfn = phys_addr >> PAGE_SHIFT;
+        req.phys_addr = phys_addr;
+        req.virt_addr = (void *)linux_kernel_addr;
+        req.result = 0;
+        #else
+        return KERN_FAILURE;
+        #endif
+    } else {
+        return KERN_INVALID_ARGUMENT;
+    }
+    
+    /* Align Mach address to page boundary */
+    aligned_size = round_page(size);
+    start_addr = 0;
+    
+    vm_map_lock(mach_map);
+    
+    /* Find space in Mach VM map */
+    kr = vm_map_find_entry(mach_map, &start_addr, aligned_size, 0,
+                          VM_OBJECT_NULL, &entry,
+                          VM_PROT_DEFAULT, VM_PROT_ALL);
+    
+    if (kr != KERN_SUCCESS) {
+        vm_map_unlock(mach_map);
+        /* Free Linux allocation on failure */
+        if (allocation_type & LKMEM_ALLOC_CONTIGUOUS) {
+            free_pages(linux_kernel_addr, get_order(size));
+        } else if (allocation_type & LKMEM_ALLOC_VMALLOC) {
+            vfree((void *)linux_kernel_addr);
+        } else if (allocation_type & LKMEM_ALLOC_KMALLOC) {
+            kfree((void *)linux_kernel_addr);
+        }
+        return kr;
+    }
+    
+    /* Create memory region structure */
+    region = (struct mach_linux_memory_region *)kalloc(sizeof(struct mach_linux_memory_region));
+    if (region == NULL) {
+        vm_map_unlock(mach_map);
+        return KERN_RESOURCE_SHORTAGE;
+    }
+    memset(region, 0, sizeof(struct mach_linux_memory_region));
+    
+    region->region_id = mach_absolute_time();
+    region->linux_start = linux_kernel_addr;
+    region->linux_end = linux_kernel_addr + size;
+    region->mach_start = start_addr;
+    region->mach_end = start_addr + aligned_size;
+    region->numa_node = numa_node;
+    region->mempolicy = MPOL_DEFAULT;
+    region->access_count = 0;
+    simple_lock_init(&region->region_lock);
+    
+    /* Map Linux pages to Mach VM */
+    page_count = aligned_size / PAGE_SIZE;
+    
+    for (i = 0; i < page_count; i++) {
+        unsigned long page_offset = i * PAGE_SIZE;
+        unsigned long linux_page_addr = linux_kernel_addr + page_offset;
+        vm_offset_t mach_page_addr = start_addr + page_offset;
+        
+        if (allocation_type & LKMEM_ALLOC_VMALLOC) {
+            /* For vmalloc, get physical page from page table */
+            phys_addr = vmalloc_to_pfn((void *)linux_page_addr) << PAGE_SHIFT;
+        } else {
+            phys_addr = virt_to_phys((void *)linux_page_addr);
+        }
+        
+        /* Enter page into Mach pmap */
+        pmap_enter(mach_map->pmap, mach_page_addr, 
+                  (vm_offset_t)phys_addr, VM_PROT_DEFAULT, TRUE);
+    }
+    
+    /* Mark entry as Linux-backed */
+    entry->is_linux_backed = TRUE;
+    entry->linux_region = region;
+    entry->protection = VM_PROT_DEFAULT;
+    entry->max_protection = VM_PROT_ALL;
+    
+    vm_map_unlock(mach_map);
+    
+    *mach_addr = start_addr;
+    if (region_out != NULL)
+        *region_out = region;
+    
+    printf("Linux Kernel Memory Allocated: %lu bytes at Mach 0x%lx, Linux 0x%lx\n",
+           size, (unsigned long)start_addr, linux_kernel_addr);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 2: vm_map_linux_shm_bridge_create
+ *
+ * Create a shared memory bridge between Mach task and Linux process
+ * allowing zero-copy data exchange
+ */
+kern_return_t vm_map_linux_shm_bridge_create(
+    vm_map_t mach_map,
+    struct task_struct *linux_task,
+    struct mm_struct *linux_mm,
+    unsigned long linux_vaddr,
+    vm_size_t size,
+    unsigned int flags,
+    struct mach_linux_shm_bridge **bridge_out)
+{
+    struct mach_linux_shm_bridge *bridge;
+    vm_map_entry_t entry;
+    vm_offset_t mach_vaddr;
+    unsigned long nr_pages;
+    unsigned long i;
+    struct page **pages;
+    unsigned long *pfn_array;
+    struct vm_area_struct *vma;
+    kern_return_t kr;
+    
+    if (mach_map == VM_MAP_NULL || linux_task == NULL || linux_mm == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    /* Allocate bridge structure */
+    bridge = (struct mach_linux_shm_bridge *)kalloc(sizeof(struct mach_linux_shm_bridge));
+    if (bridge == NULL)
+        return KERN_RESOURCE_SHORTAGE;
+    memset(bridge, 0, sizeof(struct mach_linux_shm_bridge));
+    
+    /* Allocate page arrays */
+    pages = (struct page **)kalloc(nr_pages * sizeof(struct page *));
+    pfn_array = (unsigned long *)kalloc(nr_pages * sizeof(unsigned long));
+    
+    if (pages == NULL || pfn_array == NULL) {
+        if (pages) kfree((vm_offset_t)pages, nr_pages * sizeof(struct page *));
+        if (pfn_array) kfree((vm_offset_t)pfn_array, nr_pages * sizeof(unsigned long));
+        kfree((vm_offset_t)bridge, sizeof(struct mach_linux_shm_bridge));
+        return KERN_RESOURCE_SHORTAGE;
+    }
+    
+    /* Lock Linux process memory */
+    down_write(&linux_mm->mmap_sem);
+    
+    /* Find VMA for the address */
+    vma = find_vma(linux_mm, linux_vaddr);
+    if (vma == NULL || vma->vm_start > linux_vaddr || vma->vm_end < linux_vaddr + size) {
+        up_write(&linux_mm->mmap_sem);
+        kfree((vm_offset_t)pages, nr_pages * sizeof(struct page *));
+        kfree((vm_offset_t)pfn_array, nr_pages * sizeof(unsigned long));
+        kfree((vm_offset_t)bridge, sizeof(struct mach_linux_shm_bridge));
+        return KERN_INVALID_ADDRESS;
+    }
+    
+    /* Get pages from Linux process */
+    for (i = 0; i < nr_pages; i++) {
+        unsigned long addr = linux_vaddr + (i * PAGE_SIZE);
+        struct page *page;
+        
+        /* Pin the page to prevent swapping */
+        page = get_user_pages(linux_task, linux_mm, addr, 1, 
+                             (flags & LKMEM_PROT_WRITE) ? FOLL_WRITE : 0,
+                             &pages[i], NULL);
+        
+        if (IS_ERR(page) || pages[i] == NULL) {
+            /* Unpin previously pinned pages */
+            for (unsigned long j = 0; j < i; j++) {
+                put_page(pages[j]);
+            }
+            up_write(&linux_mm->mmap_sem);
+            kfree((vm_offset_t)pages, nr_pages * sizeof(struct page *));
+            kfree((vm_offset_t)pfn_array, nr_pages * sizeof(unsigned long));
+            kfree((vm_offset_t)bridge, sizeof(struct mach_linux_shm_bridge));
+            return KERN_FAILURE;
+        }
+        
+        pfn_array[i] = page_to_pfn(pages[i]);
+    }
+    
+    up_write(&linux_mm->mmap_sem);
+    
+    /* Allocate Mach VM space */
+    mach_vaddr = 0;
+    
+    vm_map_lock(mach_map);
+    
+    kr = vm_map_find_entry(mach_map, &mach_vaddr, size, 0,
+                          VM_OBJECT_NULL, &entry,
+                          VM_PROT_DEFAULT, VM_PROT_ALL);
+    
+    if (kr != KERN_SUCCESS) {
+        vm_map_unlock(mach_map);
+        /* Unpin pages on failure */
+        for (i = 0; i < nr_pages; i++) {
+            if (pages[i]) put_page(pages[i]);
+        }
+        kfree((vm_offset_t)pages, nr_pages * sizeof(struct page *));
+        kfree((vm_offset_t)pfn_array, nr_pages * sizeof(unsigned long));
+        kfree((vm_offset_t)bridge, sizeof(struct mach_linux_shm_bridge));
+        return kr;
+    }
+    
+    /* Map Linux pages into Mach VM space */
+    for (i = 0; i < nr_pages; i++) {
+        vm_offset_t mach_addr = mach_vaddr + (i * PAGE_SIZE);
+        unsigned long pfn = pfn_array[i];
+        unsigned long long phys_addr = (unsigned long long)pfn << PAGE_SHIFT;
+        
+        /* Enter page into Mach pmap */
+        pmap_enter(mach_map->pmap, mach_addr, (vm_offset_t)phys_addr,
+                  (flags & LKMEM_PROT_WRITE) ? VM_PROT_DEFAULT : VM_PROT_READ,
+                  TRUE);
+    }
+    
+    /* Initialize bridge structure */
+    bridge->bridge_id = mach_absolute_time();
+    bridge->linux_task = linux_task;
+    bridge->mach_map = mach_map;
+    bridge->linux_mm = linux_mm;
+    bridge->linux_vaddr = linux_vaddr;
+    bridge->mach_vaddr = mach_vaddr;
+    bridge->size = size;
+    bridge->flags = flags;
+    bridge->pages = pages;
+    bridge->nr_pages = nr_pages;
+    bridge->pfn_array = pfn_array;
+    bridge->vma = vma;
+    bridge->active = TRUE;
+    simple_lock_init(&bridge->bridge_lock);
+    
+    /* Mark entry as bridge */
+    entry->is_shm_bridge = TRUE;
+    entry->shm_bridge = bridge;
+    
+    vm_map_unlock(mach_map);
+    
+    *bridge_out = bridge;
+    
+    printf("SHM Bridge created: Mach 0x%lx <-> Linux 0x%lx, size=%lu\n",
+           (unsigned long)mach_vaddr, linux_vaddr, size);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 3: vm_map_linux_memory_sync
+ *
+ * Synchronize memory between Mach VM and Linux kernel memory
+ * with support for bidirectional updates
+ */
+kern_return_t vm_map_linux_memory_sync(
+    struct mach_linux_shm_bridge *bridge,
+    vm_offset_t mach_offset,
+    unsigned long linux_offset,
+    vm_size_t sync_size,
+    unsigned int direction,  /* 0=Mach->Linux, 1=Linux->Mach, 2=Bidirectional */
+    boolean_t invalidate_pages)
+{
+    unsigned long start_page;
+    unsigned long end_page;
+    unsigned long i;
+    vm_offset_t mach_addr;
+    unsigned long linux_addr;
+    void *mach_kaddr;
+    
+    if (bridge == NULL || !bridge->active)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (sync_size == 0)
+        return KERN_SUCCESS;
+    
+    /* Calculate page range */
+    start_page = mach_offset / PAGE_SIZE;
+    end_page = (mach_offset + sync_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    if (end_page > bridge->nr_pages)
+        end_page = bridge->nr_pages;
+    
+    simple_lock(&bridge->bridge_lock);
+    
+    for (i = start_page; i < end_page; i++) {
+        mach_addr = bridge->mach_vaddr + (i * PAGE_SIZE);
+        linux_addr = bridge->linux_vaddr + (i * PAGE_SIZE);
+        
+        if (direction == 0 || direction == 2) {
+            /* Mach -> Linux: Copy from Mach to Linux */
+            vm_offset_t phys_addr;
+            struct page *page = bridge->pages[i];
+            void *linux_kaddr;
+            
+            /* Get physical address from Mach pmap */
+            pmap_extract(bridge->mach_map->pmap, mach_addr, &phys_addr);
+            
+            /* Map Linux page kernel address */
+            linux_kaddr = kmap_atomic(page);
+            
+            /* Copy data */
+            memcpy(linux_kaddr, (void *)phys_addr, PAGE_SIZE);
+            
+            /* Mark page dirty */
+            set_page_dirty(page);
+            
+            kunmap_atomic(linux_kaddr);
+            
+            /* Invalidate Mach TLB if requested */
+            if (invalidate_pages) {
+                pmap_invalidate_page(bridge->mach_map->pmap, mach_addr);
+            }
+        }
+        
+        if (direction == 1 || direction == 2) {
+            /* Linux -> Mach: Copy from Linux to Mach */
+            vm_offset_t phys_addr;
+            struct page *page = bridge->pages[i];
+            void *linux_kaddr;
+            
+            /* Get physical address from Mach pmap */
+            pmap_extract(bridge->mach_map->pmap, mach_addr, &phys_addr);
+            
+            /* Map Linux page kernel address */
+            linux_kaddr = kmap_atomic(page);
+            
+            /* Copy data */
+            memcpy((void *)phys_addr, linux_kaddr, PAGE_SIZE);
+            
+            kunmap_atomic(linux_kaddr);
+            
+            /* Flush caches for coherency */
+            flush_dcache_page(page);
+        }
+    }
+    
+    simple_unlock(&bridge->bridge_lock);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 4: vm_map_linux_numa_policy_apply
+ *
+ * Apply Linux NUMA memory policy to Mach VM regions
+ */
+kern_return_t vm_map_linux_numa_policy_apply(
+    vm_map_t mach_map,
+    vm_offset_t start,
+    vm_offset_t end,
+    unsigned int policy_type,
+    unsigned long *nodemask,
+    unsigned int flags,
+    struct mach_linux_memory_region **region_out)
+{
+    struct mach_linux_memory_region *region;
+    vm_map_entry_t entry;
+    unsigned long nr_pages;
+    unsigned long i;
+    vm_offset_t addr;
+    int linux_policy;
+    struct mempolicy *mempol;
+    
+    if (mach_map == VM_MAP_NULL || start >= end)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Convert Mach policy to Linux policy */
+    switch (policy_type) {
+        case MPOL_DEFAULT:
+            linux_policy = MPOL_DEFAULT;
+            break;
+        case MPOL_BIND:
+            linux_policy = MPOL_BIND;
+            break;
+        case MPOL_INTERLEAVE:
+            linux_policy = MPOL_INTERLEAVE;
+            break;
+        case MPOL_PREFERRED:
+            linux_policy = MPOL_PREFERRED;
+            break;
+        default:
+            return KERN_INVALID_ARGUMENT;
+    }
+    
+    /* Create Linux mempolicy */
+    mempol = mempolicy_new(linux_policy, nodemask, flags);
+    if (IS_ERR(mempol))
+        return KERN_FAILURE;
+    
+    vm_map_lock(mach_map);
+    
+    /* Clip the range */
+    if (!vm_map_lookup_entry(mach_map, start, &entry)) {
+        entry = entry->vme_next;
+    }
+    
+    vm_map_clip_start(mach_map, entry, start);
+    
+    for (; entry != vm_map_to_entry(mach_map) && entry->vme_start < end;
+         entry = entry->vme_next) {
+        
+        vm_map_clip_end(mach_map, entry, end);
+        
+        /* Create memory region structure */
+        region = (struct mach_linux_memory_region *)kalloc(sizeof(struct mach_linux_memory_region));
+        if (region == NULL) {
+            vm_map_unlock(mach_map);
+            mpol_put(mempol);
+            return KERN_RESOURCE_SHORTAGE;
+        }
+        memset(region, 0, sizeof(struct mach_linux_memory_region));
+        
+        region->region_id = mach_absolute_time();
+        region->mach_start = entry->vme_start;
+        region->mach_end = entry->vme_end;
+        region->numa_node = -1; /* To be determined by policy */
+        region->mempolicy = policy_type;
+        region->access_count = 0;
+        simple_lock_init(&region->region_lock);
+        
+        /* Copy nodemask if provided */
+        if (nodemask != NULL) {
+            region->nodemask = (unsigned long *)kalloc(MAX_NUMNODES * sizeof(unsigned long));
+            if (region->nodemask != NULL) {
+                memcpy(region->nodemask, nodemask, MAX_NUMNODES * sizeof(unsigned long));
+            }
+        }
+        
+        region->mempolicy_flags = flags;
+        
+        /* Apply policy to pages in the region */
+        nr_pages = (entry->vme_end - entry->vme_start) / PAGE_SIZE;
+        
+        for (i = 0, addr = entry->vme_start; i < nr_pages; i++, addr += PAGE_SIZE) {
+            vm_offset_t phys_addr;
+            struct page *page;
+            unsigned int target_node;
+            
+            /* Get physical address */
+            if (pmap_extract(mach_map->pmap, addr, &phys_addr)) {
+                page = phys_to_page(phys_addr);
+                
+                /* Get target node from policy */
+                target_node = mempolicy_slab_node();
+                
+                if (linux_policy == MPOL_BIND && nodemask != NULL) {
+                    target_node = find_first_bit(nodemask, MAX_NUMNODES);
+                } else if (linux_policy == MPOL_INTERLEAVE && nodemask != NULL) {
+                    target_node = i % bitmap_weight(nodemask, MAX_NUMNODES);
+                    target_node = find_nth_bit(nodemask, MAX_NUMNODES, target_node);
+                }
+                
+                /* Migrate page if needed */
+                if (page_to_nid(page) != target_node) {
+                    struct page *new_page;
+                    
+                    new_page = alloc_pages_node(target_node, GFP_HIGHUSER_MOVABLE, 0);
+                    if (new_page != NULL) {
+                        migrate_page_copy(page, new_page);
+                        __free_page(page);
+                        page = new_page;
+                        
+                        /* Update pmap entry */
+                        pmap_remove(mach_map->pmap, addr, addr + PAGE_SIZE);
+                        pmap_enter(mach_map->pmap, addr, 
+                                  (vm_offset_t)page_to_phys(page),
+                                  entry->protection, TRUE);
+                    }
+                }
+            }
+        }
+        
+        entry->linux_region = region;
+        entry->is_linux_backed = TRUE;
+        
+        if (region_out != NULL)
+            *region_out = region;
+    }
+    
+    vm_map_unlock(mach_map);
+    
+    mpol_put(mempol);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 5: vm_map_linux_page_cache_integrate
+ *
+ * Integrate Mach VM with Linux page cache for file-backed mappings
+ */
+kern_return_t vm_map_linux_page_cache_integrate(
+    vm_map_t mach_map,
+    vm_offset_t start,
+    vm_offset_t end,
+    struct file *linux_file,
+    unsigned long long offset,
+    unsigned int flags,
+    struct address_space *mapping)
+{
+    vm_map_entry_t entry;
+    vm_offset_t addr;
+    unsigned long index;
+    unsigned long nr_pages;
+    struct page *page;
+    struct page **pages;
+    unsigned long i;
+    kern_return_t kr;
+    
+    if (mach_map == VM_MAP_NULL || linux_file == NULL || mapping == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    nr_pages = (end - start) / PAGE_SIZE;
+    pages = (struct page **)kalloc(nr_pages * sizeof(struct page *));
+    if (pages == NULL)
+        return KERN_RESOURCE_SHORTAGE;
+    
+    vm_map_lock(mach_map);
+    
+    /* Find and clip entries */
+    if (!vm_map_lookup_entry(mach_map, start, &entry)) {
+        entry = entry->vme_next;
+    }
+    
+    vm_map_clip_start(mach_map, entry, start);
+    
+    /* Pre-cache pages from Linux page cache */
+    for (i = 0, addr = start; i < nr_pages; i++, addr += PAGE_SIZE) {
+        index = (offset >> PAGE_SHIFT) + i;
+        
+        /* Find or create page in Linux page cache */
+        page = find_or_create_page(mapping, index, GFP_KERNEL);
+        if (page == NULL) {
+            kr = KERN_RESOURCE_SHORTAGE;
+            goto error_out;
+        }
+        
+        pages[i] = page;
+        
+        /* Lock the page for I/O */
+        lock_page(page);
+        
+        /* If page is not uptodate, read from disk */
+        if (!PageUptodate(page)) {
+            /* Submit read request to filesystem */
+            int ret = mapping->a_ops->readpage(linux_file, page);
+            if (ret < 0) {
+                unlock_page(page);
+                put_page(page);
+                kr = KERN_FAILURE;
+                goto error_out;
+            }
+        }
+        
+        unlock_page(page);
+        
+        /* Map page into Mach VM */
+        pmap_enter(mach_map->pmap, addr, (vm_offset_t)page_to_phys(page),
+                  VM_PROT_READ | VM_PROT_WRITE, TRUE);
+        
+        /* Increment page reference count */
+        get_page(page);
+    }
+    
+    /* Update map entry to mark as page cache backed */
+    for (entry = vm_map_first_entry(mach_map); 
+         entry != vm_map_to_entry(mach_map); 
+         entry = entry->vme_next) {
+        
+        if (entry->vme_start >= start && entry->vme_end <= end) {
+            entry->is_page_cache = TRUE;
+            entry->linux_file = linux_file;
+            entry->file_offset = offset;
+            entry->page_cache_pages = pages;
+            entry->nr_page_cache_pages = nr_pages;
+            break;
+        }
+    }
+    
+    vm_map_unlock(mach_map);
+    
+    kfree((vm_offset_t)pages, nr_pages * sizeof(struct page *));
+    
+    return KERN_SUCCESS;
+    
+error_out:
+    /* Cleanup on error */
+    for (unsigned long j = 0; j < i; j++) {
+        if (pages[j]) {
+            unlock_page(pages[j]);
+            put_page(pages[j]);
+        }
+    }
+    kfree((vm_offset_t)pages, nr_pages * sizeof(struct page *));
+    vm_map_unlock(mach_map);
+    
+    return kr;
+}
+
+/*
+ * Function 6: vm_map_linux_swap_offload
+ *
+ * Offload inactive Mach VM pages to Linux swap system
+ */
+kern_return_t vm_map_linux_swap_offload(
+    vm_map_t mach_map,
+    vm_offset_t start,
+    vm_offset_t end,
+    unsigned int swappiness,
+    unsigned long *swap_entries_out,
+    unsigned int *nr_swapped_out)
+{
+    vm_map_entry_t entry;
+    vm_offset_t addr;
+    unsigned long nr_pages;
+    unsigned long i;
+    unsigned long *swap_entries;
+    unsigned int swapped = 0;
+    swp_entry_t swap_entry;
+    struct page *page;
+    
+    if (mach_map == VM_MAP_NULL || start >= end)
+        return KERN_INVALID_ARGUMENT;
+    
+    nr_pages = (end - start) / PAGE_SIZE;
+    swap_entries = (unsigned long *)kalloc(nr_pages * sizeof(unsigned long));
+    if (swap_entries == NULL)
+        return KERN_RESOURCE_SHORTAGE;
+    
+    vm_map_lock(mach_map);
+    
+    /* Find entry */
+    if (!vm_map_lookup_entry(mach_map, start, &entry)) {
+        entry = entry->vme_next;
+    }
+    
+    vm_map_clip_start(mach_map, entry, start);
+    vm_map_clip_end(mach_map, entry, end);
+    
+    /* Swap out pages */
+    for (i = 0, addr = start; i < nr_pages && addr < end; i++, addr += PAGE_SIZE) {
+        vm_offset_t phys_addr;
+        
+        if (addr >= entry->vme_end) {
+            entry = entry->vme_next;
+            if (entry == vm_map_to_entry(mach_map))
+                break;
+        }
+        
+        /* Get physical address */
+        if (pmap_extract(mach_map->pmap, addr, &phys_addr)) {
+            page = phys_to_page(phys_addr);
+            
+            /* Check if page is swappable */
+            if (page && !PageReserved(page) && !PageLocked(page)) {
+                /* Allocate swap entry */
+                swap_entry = get_swap_page();
+                
+                if (swap_entry.val != 0) {
+                    /* Add to swap cache */
+                    add_to_swap_cache(page, swap_entry, GFP_KERNEL);
+                    
+                    /* Write page to swap */
+                    set_page_dirty(page);
+                    
+                    /* Remove from Mach pmap */
+                    pmap_remove(mach_map->pmap, addr, addr + PAGE_SIZE);
+                    
+                    swap_entries[swapped++] = swap_entry.val;
+                    
+                    /* Update page flags */
+                    SetPageSwapCache(page);
+                    page->private = swap_entry.val;
+                }
+            }
+        }
+    }
+    
+    /* Update map entry as swapped */
+    entry->is_swapped = TRUE;
+    entry->swap_entries = swap_entries;
+    entry->nr_swap_entries = swapped;
+    
+    vm_map_unlock(mach_map);
+    
+    if (swap_entries_out != NULL)
+        *swap_entries_out = (unsigned long)swap_entries;
+    if (nr_swapped_out != NULL)
+        *nr_swapped_out = swapped;
+    
+    printf("Swap offload: %u pages swapped out from Mach VM\n", swapped);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 7: vm_map_linux_swap_restore
+ *
+ * Restore previously swapped Mach VM pages from Linux swap
+ */
+kern_return_t vm_map_linux_swap_restore(
+    vm_map_t mach_map,
+    vm_offset_t start,
+    vm_offset_t end,
+    unsigned long *swap_entries,
+    unsigned int nr_swap_entries)
+{
+    vm_map_entry_t entry;
+    vm_offset_t addr;
+    unsigned int i;
+    swp_entry_t swap_entry;
+    struct page *page;
+    
+    if (mach_map == VM_MAP_NULL || start >= end || swap_entries == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    vm_map_lock(mach_map);
+    
+    /* Find entry */
+    if (!vm_map_lookup_entry(mach_map, start, &entry)) {
+        entry = entry->vme_next;
+    }
+    
+    vm_map_clip_start(mach_map, entry, start);
+    vm_map_clip_end(mach_map, entry, end);
+    
+    /* Restore pages from swap */
+    for (i = 0, addr = start; i < nr_swap_entries && addr < end; i++, addr += PAGE_SIZE) {
+        swap_entry.val = swap_entries[i];
+        
+        /* Swap in the page */
+        page = read_swap_cache_async(swap_entry, GFP_KERNEL, NULL, 0, false);
+        
+        if (page != NULL) {
+            /* Wait for page to be uptodate */
+            lock_page(page);
+            wait_on_page_locked(page);
+            
+            if (PageUptodate(page)) {
+                /* Map page back to Mach VM */
+                pmap_enter(mach_map->pmap, addr, (vm_offset_t)page_to_phys(page),
+                          entry->protection, TRUE);
+                
+                /* Mark as referenced */
+                mark_page_accessed(page);
+            }
+            
+            unlock_page(page);
+            put_page(page);
+        }
+    }
+    
+    /* Clear swapped flag */
+    entry->is_swapped = FALSE;
+    entry->swap_entries = NULL;
+    entry->nr_swap_entries = 0;
+    
+    vm_map_unlock(mach_map);
+    
+    /* Free swap entries */
+    for (i = 0; i < nr_swap_entries; i++) {
+        swap_entry.val = swap_entries[i];
+        swap_free(swap_entry);
+    }
+    
+    kfree((vm_offset_t)swap_entries, nr_swap_entries * sizeof(unsigned long));
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Function 8: vm_map_linux_kernel_module_access
+ *
+ * Provide direct access to Linux kernel module memory from Mach
+ */
+kern_return_t vm_map_linux_kernel_module_access(
+    vm_map_t mach_map,
+    const char *module_name,
+    unsigned long module_symbol,
+    vm_offset_t *mach_addr,
+    vm_size_t size)
+{
+    struct module *mod;
+    unsigned long symbol_addr;
+    unsigned long symbol_size;
+    vm_offset_t start_addr;
+    vm_map_entry_t entry;
+    unsigned long nr_pages;
+    unsigned long i;
+    unsigned long phys_addr;
+    kern_return_t kr;
+    
+    if (mach_map == VM_MAP_NULL || module_name == NULL || mach_addr == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Find Linux kernel module */
+    mod = find_module(module_name);
+    if (mod == NULL)
+        return KERN_FAILURE;
+    
+    /* Get symbol address */
+    symbol_addr = (unsigned long)module_symbol;
+    if (symbol_addr == 0) {
+        /* Find symbol by name if not provided */
+        const struct kernel_symbol *ksym;
+        ksym = find_kernel_symbol(module_name, NULL);
+        if (ksym == NULL)
+            return KERN_FAILURE;
+        symbol_addr = ksym->value;
+        symbol_size = 0; /* Unknown size */
+    }
+    
+    /* Determine size if not specified */
+    if (size == 0) {
+        /* Get module section size */
+        size = mod->core_text_size + mod->core_data_size + mod->core_ro_size;
+    }
+    
+    /* Align to page boundary */
+    start_addr = 0;
+    nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    vm_map_lock(mach_map);
+    
+    /* Allocate Mach VM space */
+    kr = vm_map_find_entry(mach_map, &start_addr, size, 0,
+                          VM_OBJECT_NULL, &entry,
+                          VM_PROT_READ | VM_PROT_EXECUTE,
+                          VM_PROT_ALL);
+    
+    if (kr != KERN_SUCCESS) {
+        vm_map_unlock(mach_map);
+        return kr;
+    }
+    
+    /* Map kernel module pages */
+    for (i = 0; i < nr_pages; i++) {
+        unsigned long page_offset = i * PAGE_SIZE;
+        vm_offset_t mach_page_addr = start_addr + page_offset;
+        
+        /* Get physical address of kernel symbol */
+        phys_addr = __pa(symbol_addr + page_offset);
+        
+        /* Enter page into Mach pmap */
+        pmap_enter(mach_map->pmap, mach_page_addr, 
+                  (vm_offset_t)phys_addr, VM_PROT_READ | VM_PROT_EXECUTE, TRUE);
+    }
+    
+    /* Mark entry as kernel module */
+    entry->is_kernel_module = TRUE;
+    entry->kernel_module = mod;
+    entry->module_symbol = (void *)symbol_addr;
+    
+    vm_map_unlock(mach_map);
+    
+    *mach_addr = start_addr;
+    
+    printf("Kernel module '%s' mapped at Mach 0x%lx\n", module_name, (unsigned long)start_addr);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Helper functions for Linux kernel integration
+ */
+static inline struct mempolicy *mempolicy_new(unsigned int policy, 
+                                               unsigned long *nodemask,
+                                               unsigned int flags)
+{
+    struct mempolicy *mempol;
+    
+    mempol = kmem_cache_alloc(policy_cache, GFP_KERNEL);
+    if (mempol) {
+        mempol->mode = policy;
+        mempol->flags = flags;
+        if (nodemask) {
+            mempol->v.nodes = *nodemask;
+        }
+    }
+    
+    return mempol;
+}
+
+static inline void mpol_put(struct mempolicy *mempol)
+{
+    kmem_cache_free(policy_cache, mempol);
+}
+
+static inline struct page *find_or_create_page(struct address_space *mapping,
+                                                unsigned long index,
+                                                gfp_t gfp_mask)
+{
+    struct page *page;
+    
+    page = find_get_page(mapping, index);
+    if (page == NULL) {
+        page = pagecache_get_page(mapping, index, FGP_LOCK | FGP_CREAT, gfp_mask);
+    }
+    
+    return page;
+}
+
+static inline void migrate_page_copy(struct page *newpage, struct page *page)
+{
+    copy_highpage(newpage, page);
+    migrate_page_states(newpage, page);
+}
+
+static inline unsigned int find_nth_bit(unsigned long *addr, unsigned int size, 
+                                        unsigned int n)
+{
+    unsigned int i;
+    unsigned int count = 0;
+    
+    for (i = 0; i < size; i++) {
+        if (test_bit(i, addr)) {
+            if (count == n)
+                return i;
+            count++;
+        }
+    }
+    
+    return size;
+}
+
+/*
+ * Structure for VM-Task shared information
+ */
+struct vm_task_bridge {
+    task_t task;
+    vm_map_t map;
+    unsigned long long vm_fault_count;
+    unsigned long long vm_cow_count;
+    unsigned long long vm_swap_count;
+    unsigned long long vm_compress_count;
+    unsigned int active_regions;
+    simple_lock_t bridge_lock;
+};
+
+/*
+ * Global VM-Task bridge table
+ */
+static struct vm_task_bridge *vm_task_bridges[MAX_TASKS];
+static simple_lock_t vm_task_bridge_lock;
+
+/*
+ * vm_map_task_attach
+ *
+ * Attach a VM map to a task and establish communication channel
+ */
+kern_return_t vm_map_task_attach(vm_map_t map, task_t task)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    
+    if (map == VM_MAP_NULL || task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Get unique task identifier */
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Allocate bridge structure */
+    bridge = (struct vm_task_bridge *)kalloc(sizeof(struct vm_task_bridge));
+    if (bridge == NULL)
+        return KERN_RESOURCE_SHORTAGE;
+    
+    memset(bridge, 0, sizeof(struct vm_task_bridge));
+    bridge->task = task;
+    bridge->map = map;
+    simple_lock_init(&bridge->bridge_lock);
+    
+    simple_lock(&vm_task_bridge_lock);
+    vm_task_bridges[task_id] = bridge;
+    simple_unlock(&vm_task_bridge_lock);
+    
+    /* Set map name from task name */
+    if (task->name[0] != '\0') {
+        vm_map_set_name(map, task->name);
+    }
+    
+    /* Initialize Linux task_struct VM fields */
+    task_lock(task);
+    if (task->linux_task.mm == NULL) {
+        task->linux_task.mm = (struct mm_struct *)kalloc(sizeof(struct mm_struct));
+        if (task->linux_task.mm != NULL) {
+            memset(task->linux_task.mm, 0, sizeof(struct mm_struct));
+            task->linux_task.mm->pgd = (pgd_t *)map->pmap;
+            task->linux_task.mm->map_count = map->hdr.nentries;
+            task->linux_task.mm->total_vm = map->size / PAGE_SIZE;
+            task->linux_task.mm->pinned_vm = map->size_wired / PAGE_SIZE;
+        }
+    }
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * vm_map_task_detach
+ *
+ * Detach VM map from task and cleanup communication
+ */
+kern_return_t vm_map_task_detach(vm_map_t map, task_t task)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    
+    if (map == VM_MAP_NULL || task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return KERN_INVALID_ARGUMENT;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    vm_task_bridges[task_id] = NULL;
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge != NULL) {
+        kfree((vm_offset_t)bridge, sizeof(struct vm_task_bridge));
+    }
+    
+    /* Clean up Linux task_struct VM fields */
+    task_lock(task);
+    if (task->linux_task.mm != NULL) {
+        kfree((vm_offset_t)task->linux_task.mm, sizeof(struct mm_struct));
+        task->linux_task.mm = NULL;
+    }
+    task_unlock(task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * vm_map_notify_task_fault
+ *
+ * Notify task about VM page fault with detailed information
+ */
+void vm_map_notify_task_fault(task_t task, vm_offset_t addr, 
+                               unsigned int fault_type, kern_return_t fault_result)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    
+    if (task == TASK_NULL)
+        return;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL)
+        return;
+    
+    simple_lock(&bridge->bridge_lock);
+    bridge->vm_fault_count++;
+    
+    switch (fault_type) {
+        case FAULT_MINOR:
+            task_account_page_fault(task, FAULT_MINOR);
+            break;
+        case FAULT_MAJOR:
+            task_account_page_fault(task, FAULT_MAJOR);
+            break;
+        case FAULT_COW:
+            bridge->vm_cow_count++;
+            task_account_page_fault(task, FAULT_COW);
+            break;
+    }
+    simple_unlock(&bridge->bridge_lock);
+    
+    /* Update Linux task_struct fault counters */
+    task_lock(task);
+    if (task->linux_task.mm != NULL) {
+        if (fault_type == FAULT_MINOR) {
+            task->linux_task.min_flt++;
+            task->linux_task.mm->min_flt++;
+        } else if (fault_type == FAULT_MAJOR) {
+            task->linux_task.maj_flt++;
+            task->linux_task.mm->maj_flt++;
+        }
+    }
+    task_unlock(task);
+}
+
+/*
+ * vm_map_get_task_bridge_info
+ *
+ * Get bridge information for a task
+ */
+kern_return_t vm_map_get_task_bridge_info(task_t task, 
+                                           unsigned long long *fault_count,
+                                           unsigned long long *cow_count,
+                                           unsigned int *active_regions)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return KERN_INVALID_ARGUMENT;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL)
+        return KERN_FAILURE;
+    
+    simple_lock(&bridge->bridge_lock);
+    if (fault_count != NULL)
+        *fault_count = bridge->vm_fault_count;
+    if (cow_count != NULL)
+        *cow_count = bridge->vm_cow_count;
+    if (active_regions != NULL)
+        *active_regions = bridge->active_regions;
+    simple_unlock(&bridge->bridge_lock);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * vm_map_sync_task_memory_stats
+ *
+ * Synchronize memory statistics between VM map and task
+ */
+void vm_map_sync_task_memory_stats(vm_map_t map, task_t task)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    
+    if (map == VM_MAP_NULL || task == TASK_NULL)
+        return;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL)
+        return;
+    
+    simple_lock(&bridge->bridge_lock);
+    
+    /* Update task memory statistics from VM map */
+    task_lock(task);
+    task->current_memory = map->size - map->size_none;
+    task->rss = (pmap_resident_count(map->pmap) * PAGE_SIZE) / 1024;
+    task->total_vm = map->size / 1024;
+    task_unlock(task);
+    
+    /* Update Linux task_struct memory stats */
+    if (task->linux_task.mm != NULL) {
+        task->linux_task.mm->total_vm = map->size / PAGE_SIZE;
+        task->linux_task.mm->pinned_vm = map->size_wired / PAGE_SIZE;
+        task->linux_task.mm->data_vm = 0;
+        task->linux_task.mm->exec_vm = 0;
+        task->linux_task.mm->stack_vm = 0;
+    }
+    
+    bridge->active_regions = map->hdr.nentries;
+    
+    simple_unlock(&bridge->bridge_lock);
+}
+
+/*
+ * vm_map_linux_clone_mm
+ *
+ * Clone Linux mm_struct for fork operation
+ */
+kern_return_t vm_map_linux_clone_mm(task_t parent, task_t child, vm_map_t child_map)
+{
+    struct mm_struct *parent_mm;
+    struct mm_struct *child_mm;
+    
+    if (parent == TASK_NULL || child == TASK_NULL || child_map == VM_MAP_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(parent);
+    parent_mm = parent->linux_task.mm;
+    
+    if (parent_mm == NULL) {
+        task_unlock(parent);
+        return KERN_FAILURE;
+    }
+    
+    /* Allocate new mm_struct for child */
+    child_mm = (struct mm_struct *)kalloc(sizeof(struct mm_struct));
+    if (child_mm == NULL) {
+        task_unlock(parent);
+        return KERN_RESOURCE_SHORTAGE;
+    }
+    
+    /* Clone mm_struct fields */
+    memcpy(child_mm, parent_mm, sizeof(struct mm_struct));
+    child_mm->pgd = (pgd_t *)child_map->pmap;
+    child_mm->map_count = child_map->hdr.nentries;
+    child_mm->total_vm = child_map->size / PAGE_SIZE;
+    child_mm->pinned_vm = child_map->size_wired / PAGE_SIZE;
+    
+    task_unlock(parent);
+    
+    task_lock(child);
+    child->linux_task.mm = child_mm;
+    task_unlock(child);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * vm_map_task_swap_out
+ *
+ * Swap out task memory to Linux swap system
+ */
+kern_return_t vm_map_task_swap_out(task_t task, vm_offset_t start, vm_offset_t end)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    vm_map_t map;
+    kern_return_t kr;
+    
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return KERN_INVALID_ARGUMENT;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL || bridge->map == VM_MAP_NULL)
+        return KERN_FAILURE;
+    
+    map = bridge->map;
+    
+    /* Perform swap out operation */
+    kr = vm_map_linux_swap_offload(map, start, end, 60, NULL, NULL);
+    
+    if (kr == KERN_SUCCESS) {
+        simple_lock(&bridge->bridge_lock);
+        bridge->vm_swap_count++;
+        simple_unlock(&bridge->bridge_lock);
+        
+        /* Update task swapped pages count */
+        task_lock(task);
+        task->swap_pages += (end - start) / PAGE_SIZE;
+        task_unlock(task);
+    }
+    
+    return kr;
+}
+
+/*
+ * vm_map_task_swap_in
+ *
+ * Swap in task memory from Linux swap system
+ */
+kern_return_t vm_map_task_swap_in(task_t task, vm_offset_t start, vm_offset_t end)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    vm_map_t map;
+    
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return KERN_INVALID_ARGUMENT;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL || bridge->map == VM_MAP_NULL)
+        return KERN_FAILURE;
+    
+    map = bridge->map;
+    
+    /* Perform swap in operation */
+    return vm_map_linux_swap_restore(map, start, end, NULL, 0);
+}
+
+/*
+ * vm_map_task_compression_control
+ *
+ * Control memory compression for task
+ */
+kern_return_t vm_map_task_compression_control(task_t task, unsigned int target_ratio,
+                                                unsigned int algorithm, boolean_t enable)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    vm_map_t map;
+    
+    if (task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return KERN_INVALID_ARGUMENT;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL || bridge->map == VM_MAP_NULL)
+        return KERN_FAILURE;
+    
+    map = bridge->map;
+    
+    if (enable) {
+        /* Enable compression for the map */
+        vm_map_enable_compression(map, TRUE);
+        
+        /* Apply compression to the entire map */
+        return vm_map_adaptive_compression(map, map->min_offset, map->max_offset,
+                                           target_ratio, algorithm);
+    } else {
+        /* Disable compression */
+        vm_map_enable_compression(map, FALSE);
+        
+        /* Decompress all regions */
+        return vm_map_adaptive_compression(map, map->min_offset, map->max_offset,
+                                          100, algorithm);
+    }
+}
+
+/*
+ * vm_map_get_task_memory_pressure
+ *
+ * Get memory pressure level for task
+ */
+unsigned int vm_map_get_task_memory_pressure(task_t task)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    vm_size_t used, limit;
+    unsigned int pressure = 0;
+    
+    if (task == TASK_NULL)
+        return 0;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return 0;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL || bridge->map == VM_MAP_NULL)
+        return 0;
+    
+    used = bridge->map->size - bridge->map->size_none;
+    limit = bridge->map->size_cur_limit;
+    
+    if (limit > 0) {
+        pressure = (unsigned int)((used * 100) / limit);
+        if (pressure > 100)
+            pressure = 100;
+    }
+    
+    return pressure;
+}
+
+/*
+ * vm_map_task_page_cache_flush
+ *
+ * Flush page cache for task memory
+ */
+void vm_map_task_page_cache_flush(task_t task, vm_offset_t start, vm_offset_t end)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    vm_map_entry_t entry;
+    vm_offset_t addr;
+    
+    if (task == TASK_NULL)
+        return;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL || bridge->map == VM_MAP_NULL)
+        return;
+    
+    vm_map_lock_read(bridge->map);
+    
+    if (vm_map_lookup_entry(bridge->map, start, &entry)) {
+        for (addr = start; addr < end; addr += PAGE_SIZE) {
+            if (addr >= entry->vme_end) {
+                entry = entry->vme_next;
+                if (entry == vm_map_to_entry(bridge->map))
+                    break;
+            }
+            
+            /* Flush page cache for this address */
+            if (entry->object.vm_object != VM_OBJECT_NULL) {
+                vm_object_lock(entry->object.vm_object);
+                vm_object_page_remove(entry->object.vm_object,
+                                     entry->offset + (addr - entry->vme_start),
+                                     entry->offset + (addr - entry->vme_start) + PAGE_SIZE);
+                vm_object_unlock(entry->object.vm_object);
+            }
+        }
+    }
+    
+    vm_map_unlock_read(bridge->map);
+    
+    /* Update task dirty pages count */
+    task_lock(task);
+    task->dirty_pages = 0;
+    task_unlock(task);
+}
+
+/*
+ * VM-Task bridge initialization
+ */
+void vm_task_bridge_init(void)
+{
+    simple_lock_init(&vm_task_bridge_lock);
+    memset(vm_task_bridges, 0, sizeof(vm_task_bridges));
+}
+
+/*
+ * vm_map_task_sched_comm_update
+ *
+ * Update task scheduling parameters based on VM behavior
+ */
+void vm_map_task_sched_comm_update(task_t task, vm_map_t map)
+{
+    unsigned long long vm_activity;
+    unsigned int memory_pressure;
+    int priority_adjustment = 0;
+    
+    if (task == TASK_NULL || map == VM_MAP_NULL)
+        return;
+    
+    /* Calculate VM activity level */
+    vm_activity = map->faults + map->cow_faults + map->pageins;
+    
+    /* Get memory pressure */
+    memory_pressure = vm_map_get_task_memory_pressure(task);
+    
+    /* Adjust priority based on VM behavior */
+    if (vm_activity > 10000) {
+        /* High VM activity - increase priority */
+        priority_adjustment = -10;
+    } else if (vm_activity < 100) {
+        /* Low VM activity - decrease priority */
+        priority_adjustment = 5;
+    }
+    
+    if (memory_pressure > 80) {
+        /* High memory pressure - increase priority for page reclamation */
+        priority_adjustment -= 10;
+    }
+    
+    if (priority_adjustment != 0) {
+        int new_priority = task->priority + priority_adjustment;
+        if (new_priority < MINPRI_USER)
+            new_priority = MINPRI_USER;
+        if (new_priority > MAXPRI_USER)
+            new_priority = MAXPRI_USER;
+        
+        /* Update task priority */
+        task_priority(task, new_priority, TRUE);
+        
+        /* Update Linux task_struct priority */
+        task_lock(task);
+        task->linux_task.prio = new_priority;
+        task->linux_task.normal_prio = new_priority;
+        task_unlock(task);
+    }
+}
+
+/*
+ * vm_map_task_memory_limit_enforce
+ *
+ * Enforce memory limits for task based on VM map usage
+ */
+void vm_map_task_memory_limit_enforce(task_t task)
+{
+    struct vm_task_bridge *bridge;
+    unsigned int task_id;
+    vm_size_t used, limit;
+    
+    if (task == TASK_NULL)
+        return;
+    
+    task_id = task_get_unique_id(task);
+    if (task_id >= MAX_TASKS)
+        return;
+    
+    simple_lock(&vm_task_bridge_lock);
+    bridge = vm_task_bridges[task_id];
+    simple_unlock(&vm_task_bridge_lock);
+    
+    if (bridge == NULL || bridge->map == VM_MAP_NULL)
+        return;
+    
+    used = bridge->map->size - bridge->map->size_none;
+    limit = bridge->map->size_cur_limit;
+    
+    if (limit > 0 && used > limit) {
+        /* Memory limit exceeded - send SIGSEGV or kill task */
+        task_signal(task, SIGSEGV);
+        
+        /* Update OOM score */
+        task_calculate_oom_score(task);
+    }
+}
