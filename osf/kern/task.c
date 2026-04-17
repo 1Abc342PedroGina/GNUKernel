@@ -1184,6 +1184,11 @@ task_priority(
 	return ret;
 }
 
+static unsigned long long time_value64_to_nanoseconds(struct time_value64 tv)
+{
+    return tv.seconds * 1000000000ULL + tv.microseconds * 1000ULL;
+}
+
 /*
  *	task_set_name
  *
@@ -5681,10 +5686,338 @@ kern_return_t sched_comm_batch_update_all_params(
     return KERN_SUCCESS;
 }
 
-/*
- * Helper function: Convert time_value64 to nanoseconds
+
+
+*
+ * os_task_create_and_register
+ *
+ * Creates the imaginary OS_TASK that represents the entire operating system.
+ * This task appears in task managers showing aggregate system statistics.
+ * It is not a real task but a virtual representation for user monitoring.
  */
-static unsigned long long time_value64_to_nanoseconds(struct time_value64 tv)
+kern_return_t os_task_create_and_register(task_t *os_task_out)
 {
-    return tv.seconds * 1000000000ULL + tv.microseconds * 1000ULL;
+    task_t os_task;
+    struct time_value64 now;
+    processor_set_t default_pset;
+    kern_return_t kr;
+    
+    /* Validate output parameter */
+    if (os_task_out == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    /* Create a special task for OS representation */
+    kr = task_create_kernel(TASK_NULL, FALSE, &os_task);
+    if (kr != KERN_SUCCESS)
+        return kr;
+    
+    /* Set as OS_TASK (not a real task, but virtual representation) */
+    task_lock(os_task);
+    
+    /* Mark this as the special OS task */
+    os_task->os_task.is_os_task = TRUE;
+    
+    /* Set a recognizable name */
+    snprintf(os_task->name, sizeof(os_task->name), "kernel_task");
+    
+    /* Initialize aggregate statistics to zero */
+    memset(&os_task->os_task.aggregate_stats, 0, 
+           sizeof(os_task->os_task.aggregate_stats));
+    
+    /* Initialize CPU usage statistics */
+    os_task->os_task.cpu_usage.user_cpu_percent = 0;
+    os_task->os_task.cpu_usage.system_cpu_percent = 0;
+    os_task->os_task.cpu_usage.idle_cpu_percent = 100;
+    os_task->os_task.cpu_usage.iowait_cpu_percent = 0;
+    os_task->os_task.cpu_usage.irq_cpu_percent = 0;
+    os_task->os_task.cpu_usage.softirq_cpu_percent = 0;
+    os_task->os_task.cpu_usage.steal_cpu_percent = 0;
+    os_task->os_task.cpu_usage.guest_cpu_percent = 0;
+    
+    /* Initialize memory statistics from system values */
+    os_task->os_task.memory_stats.total_ram = (unsigned long long)vm_page_count() * PAGE_SIZE;
+    os_task->os_task.memory_stats.free_ram = (unsigned long long)vm_free_count() * PAGE_SIZE;
+    os_task->os_task.memory_stats.cached_ram = 0;
+    os_task->os_task.memory_stats.buffers_ram = 0;
+    os_task->os_task.memory_stats.total_swap = 0;
+    os_task->os_task.memory_stats.free_swap = 0;
+    os_task->os_task.memory_stats.page_cache_size = 0;
+    os_task->os_task.memory_stats.slab_usage = 0;
+    
+    /* Initialize task breakdown */
+    os_task->os_task.task_breakdown.running_tasks = 0;
+    os_task->os_task.task_breakdown.sleeping_tasks = 0;
+    os_task->os_task.task_breakdown.stopped_tasks = 0;
+    os_task->os_task.task_breakdown.zombie_tasks = 0;
+    os_task->os_task.task_breakdown.io_waiting_tasks = 0;
+    
+    /* Set timestamps */
+    read_time_stamp(current_time(), &now);
+    os_task->os_task.creation_time = now;
+    os_task->os_task.last_update = now;
+    
+    /* Initialize statistics lock */
+    simple_lock_init(&os_task->os_task.stats_lock);
+    
+    /* Set a special priority (lowest, as it's just for monitoring) */
+    os_task->priority = MINPRI_USER;
+    
+    /* Make it essential for system monitoring */
+    os_task->essential = TRUE;
+    
+    /* Set as active but not user-stoppable */
+    os_task->user_stop_count = 0;
+    os_task->suspend_count = 0;
+    
+    task_unlock(os_task);
+    
+    /* Add to default processor set for visibility */
+    default_pset = &default_pset;
+    pset_reference(default_pset);
+    pset_lock(default_pset);
+    pset_add_task(default_pset, os_task);
+    pset_unlock(default_pset);
+    
+    /* Output the created OS task */
+    *os_task_out = os_task;
+    
+    return KERN_SUCCESS;
 }
+
+/*
+ * os_task_update_aggregate_stats
+ *
+ * Updates the OS_TASK with real-time aggregate system statistics.
+ * This function collects data from all tasks and system components
+ * to present a unified view of the entire OS in the task manager.
+ */
+kern_return_t os_task_update_aggregate_stats(task_t os_task)
+{
+    processor_set_t pset;
+    task_t task;
+    thread_t thread;
+    struct time_value64 now;
+    unsigned long long total_cpu_ns = 0;
+    unsigned long long total_user_ns = 0;
+    unsigned long long total_system_ns = 0;
+    unsigned long long total_idle_ns = 0;
+    unsigned long long total_memory = 0;
+    unsigned long long total_swap_used = 0;
+    unsigned int total_threads = 0;
+    unsigned int total_tasks = 0;
+    unsigned int running_tasks = 0;
+    unsigned int sleeping_tasks = 0;
+    unsigned int stopped_tasks = 0;
+    unsigned int zombie_tasks = 0;
+    unsigned int io_waiting_tasks = 0;
+    unsigned long long total_page_faults = 0;
+    unsigned long long total_ipc_sent = 0;
+    unsigned long long total_ipc_recv = 0;
+    unsigned long long total_ctx_switches = 0;
+    unsigned long long total_syscalls = 0;
+    unsigned int total_processors;
+    unsigned long long elapsed_ns;
+    unsigned long long active_cpu_time;
+    unsigned int cpu_count;
+    
+    /* Validate OS task */
+    if (os_task == TASK_NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(os_task);
+    
+    /* Check if this is really an OS task */
+    if (!os_task->os_task.is_os_task) {
+        task_unlock(os_task);
+        return KERN_INVALID_ARGUMENT;
+    }
+    
+    simple_lock(&os_task->os_task.stats_lock);
+    
+    /* Get current time for delta calculations */
+    read_time_stamp(current_time(), &now);
+    elapsed_ns = time_value64_to_nanoseconds(
+        time_value64_subtract(now, os_task->os_task.last_update));
+    
+    /* Get number of processors */
+    total_processors = machine_get_cpu_count();
+    cpu_count = total_processors;
+    
+    /* Iterate through all processor sets and tasks to collect statistics */
+    simple_lock(&all_psets_lock);
+    
+    queue_iterate(&all_psets, pset, processor_set_t, all_psets) {
+        pset_lock(pset);
+        
+        queue_iterate(&pset->tasks, task, task_t, pset_tasks) {
+            /* Skip the OS task itself to avoid counting it */
+            if (task == os_task)
+                continue;
+            
+            total_tasks++;
+            
+            /* Collect task statistics */
+            task_lock(task);
+            
+            /* Memory statistics */
+            if (task->map != VM_MAP_NULL) {
+                total_memory += task->map->size;
+            }
+            
+            /* Page faults */
+            total_page_faults += task->faults;
+            total_page_faults += task->zero_fills;
+            total_page_faults += task->cow_faults;
+            
+            /* IPC statistics */
+            total_ipc_sent += task->messages_sent;
+            total_ipc_recv += task->messages_received;
+            
+            /* Task state breakdown */
+            if (!task->active) {
+                zombie_tasks++;
+            } else if (task->user_stop_count > 0 || task->suspend_count > 0) {
+                stopped_tasks++;
+            } else {
+                /* Check if waiting for I/O */
+                boolean_t io_waiting = FALSE;
+                queue_iterate(&task->thread_list, thread, thread_t, thread_list) {
+                    if (thread->state == TH_WAIT && thread->wait_type == WAIT_IO) {
+                        io_waiting = TRUE;
+                        break;
+                    }
+                }
+                if (io_waiting) {
+                    io_waiting_tasks++;
+                } else {
+                    running_tasks++;
+                }
+            }
+            
+            /* Thread count and CPU time accumulation */
+            queue_iterate(&task->thread_list, thread, thread_t, thread_list) {
+                spl_t s = splsched();
+                thread_lock(thread);
+                
+                total_threads++;
+                
+                /* Accumulate CPU times */
+                total_user_ns += time_value64_to_nanoseconds(thread->user_time);
+                total_system_ns += time_value64_to_nanoseconds(thread->system_time);
+                
+                /* Context switches */
+                total_ctx_switches += thread->context_switches;
+                
+                /* System calls (if tracked) */
+                total_syscalls += thread->syscall_count;
+                
+                thread_unlock(thread);
+                splx(s);
+            }
+            
+            task_unlock(task);
+        }
+        
+        pset_unlock(pset);
+    }
+    
+    simple_unlock(&all_psets_lock);
+    
+    /* Calculate total CPU time */
+    total_cpu_ns = total_user_ns + total_system_ns;
+    
+    /* Calculate total active CPU time across all processors */
+    if (elapsed_ns > 0 && cpu_count > 0) {
+        active_cpu_time = elapsed_ns * cpu_count;
+        
+        /* Calculate CPU usage percentages */
+        if (active_cpu_time > 0) {
+            os_task->os_task.cpu_usage.user_cpu_percent = 
+                (unsigned int)((total_user_ns * 1000ULL) / active_cpu_time);
+            os_task->os_task.cpu_usage.system_cpu_percent = 
+                (unsigned int)((total_system_ns * 1000ULL) / active_cpu_time);
+            
+            /* Idle time = total possible time - active time */
+            if (active_cpu_time > total_cpu_ns) {
+                total_idle_ns = active_cpu_time - total_cpu_ns;
+                os_task->os_task.cpu_usage.idle_cpu_percent = 
+                    (unsigned int)((total_idle_ns * 1000ULL) / active_cpu_time);
+            } else {
+                os_task->os_task.cpu_usage.idle_cpu_percent = 0;
+            }
+            
+            /* Normalize to 1000 (100.0%) */
+            unsigned int total_percent = 
+                os_task->os_task.cpu_usage.user_cpu_percent +
+                os_task->os_task.cpu_usage.system_cpu_percent +
+                os_task->os_task.cpu_usage.idle_cpu_percent;
+            
+            if (total_percent < 1000) {
+                os_task->os_task.cpu_usage.idle_cpu_percent += (1000 - total_percent);
+            }
+        }
+    }
+    
+    /* Update aggregate statistics */
+    os_task->os_task.aggregate_stats.total_cpu_time = total_cpu_ns;
+    os_task->os_task.aggregate_stats.total_memory_used = total_memory;
+    os_task->os_task.aggregate_stats.total_swap_used = total_swap_used;
+    os_task->os_task.aggregate_stats.total_threads = total_threads;
+    os_task->os_task.aggregate_stats.total_tasks = total_tasks;
+    os_task->os_task.aggregate_stats.total_processors = total_processors;
+    os_task->os_task.aggregate_stats.context_switches_total = total_ctx_switches;
+    os_task->os_task.aggregate_stats.system_calls_total = total_syscalls;
+    os_task->os_task.aggregate_stats.page_faults_total = total_page_faults;
+    os_task->os_task.aggregate_stats.ipc_messages_sent = total_ipc_sent;
+    os_task->os_task.aggregate_stats.ipc_messages_recv = total_ipc_recv;
+    
+    /* Update memory statistics from system */
+    os_task->os_task.memory_stats.free_ram = (unsigned long long)vm_free_count() * PAGE_SIZE;
+    os_task->os_task.memory_stats.cached_ram = (unsigned long long)vm_cache_count() * PAGE_SIZE;
+    
+    /* Update task breakdown */
+    os_task->os_task.task_breakdown.running_tasks = running_tasks;
+    os_task->os_task.task_breakdown.sleeping_tasks = sleeping_tasks;
+    os_task->os_task.task_breakdown.stopped_tasks = stopped_tasks;
+    os_task->os_task.task_breakdown.zombie_tasks = zombie_tasks;
+    os_task->os_task.task_breakdown.io_waiting_tasks = io_waiting_tasks;
+    
+    /* Set task name to show summary information */
+    snprintf(os_task->name, sizeof(os_task->name),
+             "kernel_task [CPU:%u.%u%% MEM:%lluMB TASKS:%u]",
+             os_task->os_task.cpu_usage.user_cpu_percent / 10,
+             os_task->os_task.cpu_usage.user_cpu_percent % 10,
+             total_memory / (1024 * 1024),
+             total_tasks);
+    
+    /* Update timestamp */
+    os_task->os_task.last_update = now;
+    
+    simple_unlock(&os_task->os_task.stats_lock);
+    task_unlock(os_task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Helper function: Get VM cache count (for cached memory)
+ */
+static unsigned int vm_cache_count(void)
+{
+    /* This would be implemented to return actual page cache size */
+    /* For now, return a reasonable estimate */
+    return vm_page_count() / 4;
+}
+
+/*
+ * Helper function: Get machine CPU count
+ */
+static unsigned int machine_get_cpu_count(void)
+{
+    /* This would return actual number of CPUs */
+    /* For now, return 1 or actual value from hardware */
+    extern unsigned int cpu_number;
+    return cpu_number + 1;
+}
+
+
