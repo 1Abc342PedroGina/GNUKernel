@@ -20,7 +20,7 @@
  * Mach Operating System
  * Copyright (c) 1993-1988 Carnegie Mellon University
  * All Rights Reserved.
- * License:DGPL-2.0-or-later
+ * License:GPL-2.0-or-later
  *
  * Carnegie Mellon requests users of this software to return to
  *
