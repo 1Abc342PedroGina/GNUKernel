@@ -96,11 +96,248 @@ kern_return_t task_create(
 	boolean_t	inherit_memory,
 	task_t		*child_task)		/* OUT */
 {
+	kern_return_t kr;
+	task_t new_task;
+	
 	if (parent_task == TASK_NULL)
 		return KERN_INVALID_TASK;
 
-	return task_create_kernel (parent_task, inherit_memory,
-				   child_task);
+	kr = task_create_kernel(parent_task, inherit_memory, &new_task);
+	if (kr != KERN_SUCCESS)
+		return kr;
+	
+	/* Additional security and initialization for modern systems */
+	task_lock(new_task);
+	
+	/* Initialize Linux task_struct compatibility */
+	task_init_linux_integration(new_task);
+	
+	/* Initialize OS task monitoring structures */
+	new_task->os_task.is_os_task = FALSE;
+	simple_lock_init(&new_task->os_task.stats_lock);
+	
+	/* Initialize scheduling communication structures */
+	simple_lock_init(&new_task->sched_comm.lock);
+	new_task->sched_comm.active_scheduler = SCHED_NONE;
+	memset(&new_task->sched_comm.rt_params, 0, sizeof(new_task->sched_comm.rt_params));
+	memset(&new_task->sched_comm.eevdf_params, 0, sizeof(new_task->sched_comm.eevdf_params));
+	memset(&new_task->sched_comm.cfs_params, 0, sizeof(new_task->sched_comm.cfs_params));
+	memset(&new_task->sched_comm.stats, 0, sizeof(new_task->sched_comm.stats));
+	
+	/* Initialize credentials (inherit from parent or set default) */
+	if (parent_task != TASK_NULL) {
+		task_lock(parent_task);
+		new_task->uid = parent_task->uid;
+		new_task->gid = parent_task->gid;
+		new_task->euid = parent_task->euid;
+		new_task->egid = parent_task->egid;
+		new_task->suid = parent_task->suid;
+		new_task->sgid = parent_task->sgid;
+		new_task->pid = allocate_new_pid();
+		new_task->ppid = parent_task->pid;
+		new_task->tgid = (inherit_memory) ? parent_task->tgid : new_task->pid;
+		task_unlock(parent_task);
+	} else {
+		/* Kernel task or root task */
+		new_task->uid = 0;
+		new_task->gid = 0;
+		new_task->euid = 0;
+		new_task->egid = 0;
+		new_task->suid = 0;
+		new_task->sgid = 0;
+		new_task->pid = 1;  /* init/system process */
+		new_task->ppid = 0;
+		new_task->tgid = 1;
+	}
+	
+	/* Initialize capabilities (none by default for security) */
+	new_task->capability_inheritable = 0;
+	new_task->capability_permitted = 0;
+	new_task->capability_effective = 0;
+	new_task->capability_bounding = CAP_ALL;  /* Full bounding set initially */
+	
+	/* Initialize secure bits */
+	new_task->securebits = SECBIT_NOROOT | SECBIT_NOROOT_LOCKED;
+	
+	/* Initialize namespace flags */
+	new_task->namespace_flags = 0;
+	new_task->ns_uts = NULL;
+	new_task->ns_ipc = NULL;
+	new_task->ns_net = NULL;
+	new_task->ns_pid = NULL;
+	new_task->ns_mnt = NULL;
+	new_task->ns_user = NULL;
+	
+	/* Initialize cgroup information */
+	new_task->cgroup_mask = 0;
+	new_task->cgroup_info = NULL;
+	new_task->kmem_usage = 0;
+	new_task->kmem_limit = 0;
+	new_task->kmem_peak = 0;
+	
+	/* Initialize seccomp (disabled by default) */
+	new_task->seccomp_mode = SECCOMP_MODE_DISABLED;
+	new_task->seccomp_filter = NULL;
+	
+	/* Initialize speculation control (mitigations enabled) */
+	new_task->speculation_ctrl = SPEC_CTRL_ALL_MITIGATIONS;
+	
+	/* Initialize NUMA statistics */
+	new_task->numa_mask = 0;
+	new_task->numa_preferred = 0;
+	new_task->numa_local_memory = 0;
+	new_task->numa_remote_memory = 0;
+	new_task->numa_foreign_memory = 0;
+	
+	/* Initialize I/O priority and weight */
+	new_task->io_priority = 4;  /* Default medium priority */
+	new_task->blkio_priority = 4;
+	new_task->blkio_weight = 500;  /* Default weight 500/1000 */
+	new_task->io_context_active = 0;
+	new_task->io_context_switches = 0;
+	
+	/* Initialize memory limits (unlimited by default) */
+	new_task->memory_limit = 0;
+	new_task->current_memory = 0;
+	new_task->dirty_pages = 0;
+	new_task->swap_pages = 0;
+	new_task->writeback_pages = 0;
+	
+	/* Initialize page fault counters */
+	new_task->min_flt = 0;
+	new_task->maj_flt = 0;
+	new_task->cmin_flt = 0;
+	new_task->cmaj_flt = 0;
+	new_task->nswap = 0;
+	
+	/* Initialize scheduling parameters */
+	new_task->sched_class = SCHED_CLASS_NORMAL;
+	new_task->rt_priority = 0;
+	new_task->sched_priority = 0;
+	new_task->deadline_policy = 0;
+	time_value64_init(&new_task->deadline);
+	time_value64_init(&new_task->period);
+	time_value64_init(&new_task->execution_time);
+	
+	/* Initialize lock tracking */
+	new_task->lock_count = 0;
+	new_task->lock_waiting = 0;
+	new_task->lock_wait_address = NULL;
+	memset(new_task->held_locks, 0, sizeof(new_task->held_locks));
+	
+	/* Initialize audit trail ring buffer */
+	new_task->audit_event_index = 0;
+	new_task->sessionid = 0;
+	new_task->loginuid = (unsigned int)-1;  /* Invalid login UID */
+	memset(new_task->audit_events, 0, sizeof(new_task->audit_events));
+	
+	/* Initialize trace buffer */
+	new_task->trace_index = 0;
+	memset(new_task->trace_data, 0, sizeof(new_task->trace_data));
+	
+	/* Initialize robust futex list */
+	new_task->robust_futex_list = NULL;
+	new_task->robust_futex_len = 0;
+	
+	/* Initialize debug registers */
+	new_task->debug_registers = NULL;
+	new_task->ptrace_options = 0;
+	new_task->ptrace_flags = 0;
+	new_task->ptrace_data = NULL;
+	
+	/* Initialize FPU state */
+	new_task->fpu_state = NULL;
+	
+	/* Initialize vDSO mappings */
+	new_task->vvar_info = NULL;
+	new_task->vvar_mapping = NULL;
+	new_task->vvar_sequence = 0;
+	
+	/* Initialize performance counters */
+	new_task->perf_counter_mask = 0;
+	new_task->perf_counter_data = NULL;
+	
+	/* Initialize signal handling */
+	new_task->signal_pending = 0;
+	new_task->blocked_signals = 0;
+	new_task->ignored_signals = 0;
+	new_task->exit_signal = SIGCHLD;
+	new_task->pdeath_signal = 0;
+	
+	/* Initialize path information */
+	strncpy(new_task->cwd, "/", PATH_MAX - 1);
+	new_task->cwd[PATH_MAX - 1] = '\0';
+	strncpy(new_task->root, "/", PATH_MAX - 1);
+	new_task->root[PATH_MAX - 1] = '\0';
+	new_task->umask = 022;  /* Default umask */
+	
+	/* Initialize task limits */
+	new_task->rlim_rss = RLIM_INFINITY;
+	new_task->rlim_cpu = RLIM_INFINITY;
+	new_task->rlim_fsize = RLIM_INFINITY;
+	new_task->rlim_data = RLIM_INFINITY;
+	new_task->rlim_stack = 8 * 1024 * 1024;  /* 8MB stack limit */
+	
+	/* Initialize OOM settings */
+	new_task->oom_score_adj = 0;
+	new_task->oom_score_adj_min = -1000;
+	new_task->oom_score = 0;
+	
+	/* Initialize wait channel */
+	new_task->wchan = 0;
+	new_task->wchan_name[0] = '\0';
+	
+	/* Initialize red-black tree node */
+	rb_node_init(&new_task->task_rb_node);
+	
+	/* Initialize Mach threads array */
+	memset(new_task->mach_threads, 0, sizeof(new_task->mach_threads));
+	new_task->mach_thread_count = 0;
+	
+	/* Initialize personality */
+	new_task->personality = PER_LINUX;  /* Linux personality by default */
+	
+	/* Initialize prctl options */
+	new_task->prctl_options = 0;
+	new_task->prctl_data = NULL;
+	
+	/* Initialize exit status */
+	new_task->exit_status = 0;
+	new_task->is_terminating = FALSE;
+	new_task->exit_code = 0;
+	new_task->exit_signal_code = 0;
+	
+	/* Initialize child/parent relationships */
+	queue_init(&new_task->children);
+	new_task->parent = (parent_task != TASK_NULL) ? parent_task : TASK_NULL;
+	if (new_task->parent != TASK_NULL)
+		task_reference(parent_task);
+	
+	/* Initialize zombie children list */
+	queue_init(&new_task->zombie_children);
+	
+	/* Initialize thread group */
+	queue_init(&new_task->thread_group);
+	new_task->thread_group_leader = (inherit_memory) ? 0 : 1;
+	
+	/* Initialize child TID addresses */
+	new_task->clear_child_tid = NULL;
+	new_task->set_child_tid = NULL;
+	
+	/* Log audit event for task creation */
+	task_log_audit_event(new_task, AUDIT_TASK_CREATE, NULL);
+	
+	/* Insert into process tree if parent exists */
+	if (parent_task != TASK_NULL) {
+		task_create_child_relationship(parent_task, new_task);
+	}
+	
+	task_unlock(new_task);
+	
+	/* Insert into red-black tree for fast PID lookup */
+	task_insert_into_rb_tree(new_task);
+	
+	return KERN_SUCCESS;
 }
 
 kern_return_t
@@ -297,13 +534,17 @@ kern_return_t task_terminate(
 	queue_head_t		*list;
 	task_t			cur_task;
 	spl_t			s;
-
+	unsigned int		i;
+	
 	if (task == TASK_NULL)
 		return KERN_INVALID_ARGUMENT;
 
 	list = &task->thread_list;
 	cur_task = current_task();
 	cur_thread = current_thread();
+
+	/* Log audit event for task termination */
+	task_log_audit_event(task, AUDIT_TASK_TERMINATE, NULL);
 
 	/*
 	 *	Deactivate task so that it can't be terminated again,
@@ -336,6 +577,7 @@ kern_return_t task_terminate(
 		}
 		task_hold_locked(task);
 		task->active = FALSE;
+		task->is_terminating = TRUE;
 		queue_remove(list, cur_thread, thread_t, thread_list);
 		thread_unlock(cur_thread);
 		(void) splx(s);
@@ -390,6 +632,7 @@ kern_return_t task_terminate(
 		}
 		task_hold_locked(task);
 		task->active = FALSE;
+		task->is_terminating = TRUE;
 		task_unlock(task);
 	}
 
@@ -401,6 +644,16 @@ kern_return_t task_terminate(
 	 */
 	(void) task_dowait(task,TRUE);			/* may block */
 	ipc_task_disable(task);
+
+	/*
+	 *	Clean up robust futexes before thread termination
+	 */
+	task_cleanup_robust_futexes(task);
+
+	/*
+	 *	Force unlock all held locks to prevent deadlocks
+	 */
+	task_force_unlock_all(task);
 
 	/*
 	 *	Terminate each thread in the task.
@@ -448,6 +701,132 @@ kern_return_t task_terminate(
 	 */
 	ipc_task_terminate(task);
 
+	/*
+	 *	Clean up child TID address (for futex wakeups)
+	 */
+	task_clear_child_tid(task);
+
+	/*
+	 *	Orphan all child tasks (reparent to init)
+	 */
+	task_orphan_children(task);
+
+	/*
+	 *	Clean up namespace references
+	 */
+	if (task->ns_uts != NULL) {
+		/* Release UTS namespace reference */
+		task->ns_uts = NULL;
+	}
+	if (task->ns_ipc != NULL) {
+		/* Release IPC namespace reference */
+		task->ns_ipc = NULL;
+	}
+	if (task->ns_net != NULL) {
+		/* Release NET namespace reference */
+		task->ns_net = NULL;
+	}
+	if (task->ns_pid != NULL) {
+		/* Release PID namespace reference */
+		task->ns_pid = NULL;
+	}
+	if (task->ns_mnt != NULL) {
+		/* Release MNT namespace reference */
+		task->ns_mnt = NULL;
+	}
+	if (task->ns_user != NULL) {
+		/* Release USER namespace reference */
+		task->ns_user = NULL;
+	}
+
+	/*
+	 *	Clean up cgroup information
+	 */
+	if (task->cgroup_info != NULL) {
+		/* Release cgroup reference */
+		task->cgroup_info = NULL;
+	}
+
+	/*
+	 *	Clean up seccomp filter
+	 */
+	if (task->seccomp_filter != NULL && task->seccomp_mode != SECCOMP_MODE_DISABLED) {
+		/* Free seccomp filter */
+		kfree((vm_offset_t)task->seccomp_filter, 
+		      sizeof(struct seccomp_filter));
+		task->seccomp_filter = NULL;
+	}
+
+	/*
+	 *	Clean up debug registers
+	 */
+	if (task->debug_registers != NULL) {
+		kfree((vm_offset_t)task->debug_registers, 
+		      sizeof(struct debug_regs));
+		task->debug_registers = NULL;
+	}
+
+	/*
+	 *	Clean up FPU state
+	 */
+	if (task->fpu_state != NULL) {
+		kfree((vm_offset_t)task->fpu_state, 
+		      sizeof(struct fpu_state));
+		task->fpu_state = NULL;
+	}
+
+	/*
+	 *	Clean up performance counter data
+	 */
+	if (task->perf_counter_data != NULL) {
+		kfree((vm_offset_t)task->perf_counter_data, 
+		      4096);  /* Assume 4KB perf data */
+		task->perf_counter_data = NULL;
+	}
+
+	/*
+	 *	Clean up audit trail
+	 */
+	memset(task->audit_events, 0, sizeof(task->audit_events));
+	task->audit_event_index = 0;
+
+	/*
+	 *	Clean up trace buffer
+	 */
+	memset(task->trace_data, 0, sizeof(task->trace_data));
+	task->trace_index = 0;
+
+	/*
+	 *	Clean up held locks array (should be empty already)
+	 */
+	for (i = 0; i < task->lock_count; i++) {
+		task->held_locks[i] = 0;
+	}
+	task->lock_count = 0;
+
+	/*
+	 *	Send signal to parent if requested
+	 */
+	if (task->parent != TASK_NULL && task->exit_signal != 0) {
+		task_signal(task->parent, task->exit_signal);
+	}
+
+	/*
+	 *	Update parent's child fault counters
+	 */
+	if (task->parent != TASK_NULL) {
+		task_update_child_faults(task->parent, task);
+	}
+
+	/*
+	 *	Add to parent's zombie list if parent wants to reap
+	 */
+	if (task->parent != TASK_NULL && task->parent->flags & PF_WAIT_ZOMBIE) {
+		task_add_zombie_child(task->parent, task);
+	} else {
+		/* Otherwise, just deallocate directly */
+		task_deallocate(task);
+	}
 
 	/*
 	 *	Deallocate the task's reference to itself.
@@ -473,6 +852,48 @@ kern_return_t task_terminate(
 
 	return KERN_SUCCESS;
 }
+
+/*
+ * Helper function to initialize red-black tree node
+ */
+static void rb_node_init(rb_node_t *node)
+{
+	node->rb_parent = NULL;
+	node->rb_left = NULL;
+	node->rb_right = NULL;
+	node->rb_color = RB_RED;
+}
+
+/*
+ * Additional constants and definitions
+ */
+#define CAP_ALL                0xFFFFFFFF
+#define SECBIT_NOROOT          0x00000001
+#define SECBIT_NOROOT_LOCKED   0x00000002
+#define PF_WAIT_ZOMBIE         0x00010000
+#define RLIM_INFINITY          ((unsigned long long)-1)
+#define PER_LINUX              0x00000000
+#define SPEC_CTRL_ALL_MITIGATIONS 0x000000FF
+#define AUDIT_TASK_CREATE      0x00000001
+#define AUDIT_TASK_TERMINATE   0x00000002
+
+/* Scheduler classes */
+#define SCHED_CLASS_NORMAL     0
+#define SCHED_CLASS_RT         1
+#define SCHED_CLASS_IDLE       2
+
+/* Seccomp modes */
+#define SECCOMP_MODE_DISABLED  0
+#define SECCOMP_MODE_STRICT    1
+#define SECCOMP_MODE_FILTER    2
+
+/* Namespace types */
+#define NS_TYPE_UTS            0
+#define NS_TYPE_IPC            1
+#define NS_TYPE_NET            2
+#define NS_TYPE_PID            3
+#define NS_TYPE_MNT            4
+#define NS_TYPE_USER           5
 
 /*
  *	task_hold:
