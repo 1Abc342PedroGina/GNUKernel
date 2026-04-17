@@ -6020,4 +6020,550 @@ static unsigned int machine_get_cpu_count(void)
     return cpu_number + 1;
 }
 
+/*
+ * Backward/Forward Compatibility Layer for Task Management
+ * Handles legacy APIs and obsolete data structures while providing
+ * modern high-volume data interfaces without creating new tasks
+ */
 
+/*
+ * Legacy compatibility structures (obsolete APIs)
+ */
+struct legacy_task_info_old {
+    /* Obsolete fields from Mach 2.5 / BSD 4.3 era */
+    integer_t       old_virtual_size;       /* 24-bit virtual size (obsolete) */
+    integer_t       old_resident_size;      /* 24-bit resident size (obsolete) */
+    integer_t       old_user_time;          /* 16-bit user time (wraps every 65ms) */
+    integer_t       old_system_time;        /* 16-bit system time (wraps) */
+    integer_t       old_suspend_count;      /* 8-bit suspend count (max 255) */
+    integer_t       old_priority;           /* 4-bit priority (0-15 only) */
+    integer_t       old_faults;             /* 16-bit fault count (wraps quickly) */
+    integer_t       old_pageins;            /* 16-bit pagein count */
+    char            old_name[16];           /* Old fixed-size name buffer */
+    unsigned int    old_flags;              /* Legacy flags (many deprecated) */
+    unsigned int    old_pad[4];             /* Padding for ancient compatibility */
+};
+
+struct legacy_scheduler_info {
+    /* Obsolete scheduling fields from pre-Mach 3.0 */
+    int             sched_quantum;          /* Fixed quantum (no longer used) */
+    int             sched_base_priority;    /* Base priority (ignored now) */
+    int             sched_cur_priority;     /* Current priority (deprecated) */
+    int             sched_max_priority;     /* Max priority (obsolete limit) */
+    int             sched_processor;        /* Fixed processor assignment */
+    unsigned int    sched_flags;            /* Legacy scheduling flags */
+    int             sched_bucket;           /* Old scheduler bucket system */
+    int             sched_epoch;            /* Deprecated epoch counter */
+};
+
+/*
+ * Modern high-volume data structures
+ */
+struct modern_task_bulk_data {
+    /* Large-scale data arrays for modern monitoring */
+    unsigned int    cpu_usage_history[1024];    /* 4KB of CPU history */
+    unsigned int    memory_usage_history[1024]; /* 4KB of memory history */
+    unsigned long long io_history[1024];         /* 8KB of I/O history */
+    unsigned int    page_fault_history[1024];    /* 4KB of fault history */
+    unsigned int    context_switch_history[1024]; /* 4KB of switch history */
+    unsigned int    ipc_history[1024];           /* 4KB of IPC history */
+    
+    /* Performance counters (64-bit for high precision) */
+    unsigned long long perf_instructions;
+    unsigned long long perf_cycles;
+    unsigned long long perf_branch_misses;
+    unsigned long long perf_cache_misses;
+    unsigned long long perf_memory_loads;
+    unsigned long long perf_memory_stores;
+    
+    /* NUMA statistics */
+    unsigned int    numa_local_access[64];      /* Per-node local accesses */
+    unsigned int    numa_remote_access[64];     /* Per-node remote accesses */
+    unsigned int    numa_foreign_access[64];    /* Per-node foreign accesses */
+    
+    /* Container/namespace statistics */
+    unsigned int    cgroup_cpu_usage[16];       /* Per-cgroup CPU usage */
+    unsigned int    cgroup_memory_usage[16];    /* Per-cgroup memory usage */
+    unsigned int    cgroup_io_usage[16];        /* Per-cgroup I/O usage */
+    
+    /* Security audit trail (ring buffer) */
+    struct audit_event audit_events[256];       /* 256 recent audit events */
+    unsigned int    audit_event_index;
+    
+    /* Tracing data */
+    unsigned long long trace_points[4096];      /* 32KB of trace data */
+    unsigned int    trace_index;
+};
+
+/*
+ * task_compatibility_legacy_adapter
+ *
+ * Adapts modern task data to obsolete/legacy API expectations.
+ * Handles data truncation, wrapping, and format conversion for old binaries.
+ * Does NOT create new tasks, only provides compatibility layer.
+ */
+kern_return_t task_compatibility_legacy_adapter(
+    task_t                  modern_task,
+    struct legacy_task_info_old *legacy_info_out,
+    struct legacy_scheduler_info *legacy_sched_out,
+    unsigned int            legacy_flags,
+    boolean_t               emulate_wrapping)
+{
+    struct time_value64 now;
+    unsigned long long total_time_ns;
+    unsigned int old_faults;
+    unsigned int old_pageins;
+    unsigned long long virtual_size_mb;
+    unsigned long long resident_size_mb;
+    
+    if (modern_task == TASK_NULL || legacy_info_out == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    task_lock(modern_task);
+    
+    /* Calculate values with legacy limitations */
+    
+    /* Virtual size: old API only supported 24-bit (max 16MB) */
+    virtual_size_mb = (modern_task->map ? modern_task->map->size : 0) / (1024 * 1024);
+    if (virtual_size_mb > 0xFFFFFF) {
+        /* Truncate to 24 bits for legacy compatibility */
+        legacy_info_out->old_virtual_size = (integer_t)(virtual_size_mb & 0xFFFFFF);
+    } else {
+        legacy_info_out->old_virtual_size = (integer_t)virtual_size_mb;
+    }
+    
+    /* Resident size: also 24-bit limit */
+    resident_size_mb = (pmap_resident_count(modern_task->map->pmap) * PAGE_SIZE) / (1024 * 1024);
+    legacy_info_out->old_resident_size = (integer_t)(resident_size_mb & 0xFFFFFF);
+    
+    /* Time values: old API used 16-bit values that wrap every 65.536 seconds */
+    read_time_stamp(current_time(), &now);
+    total_time_ns = time_value64_to_nanoseconds(modern_task->total_user_time);
+    
+    if (emulate_wrapping) {
+        /* Emulate the 16-bit wrap behavior of old kernels */
+        unsigned int time_16bit = (unsigned int)((total_time_ns / 1000000) & 0xFFFF);
+        legacy_info_out->old_user_time = (integer_t)time_16bit;
+        
+        total_time_ns = time_value64_to_nanoseconds(modern_task->total_system_time);
+        time_16bit = (unsigned int)((total_time_ns / 1000000) & 0xFFFF);
+        legacy_info_out->old_system_time = (integer_t)time_16bit;
+    } else {
+        /* Just truncate to 16 bits (loses high bits) */
+        legacy_info_out->old_user_time = (integer_t)(total_time_ns / 1000000) & 0xFFFF;
+        legacy_info_out->old_system_time = (integer_t)(total_time_ns / 1000000) & 0xFFFF;
+    }
+    
+    /* Suspend count: old API only supported 8-bit (max 255) */
+    if (modern_task->suspend_count > 255) {
+        legacy_info_out->old_suspend_count = 255;
+    } else {
+        legacy_info_out->old_suspend_count = (integer_t)modern_task->suspend_count;
+    }
+    
+    /* Priority: old API used 4-bit (0-15 only) */
+    int legacy_priority = modern_task->priority / 8;  /* Scale 0-127 to 0-15 */
+    if (legacy_priority > 15) legacy_priority = 15;
+    legacy_info_out->old_priority = (integer_t)legacy_priority;
+    
+    /* Fault counts: old API used 16-bit (wraps at 65535) */
+    old_faults = (modern_task->faults & 0xFFFF);
+    legacy_info_out->old_faults = (integer_t)old_faults;
+    
+    /* Pageins: also 16-bit */
+    old_pageins = (modern_task->pageins & 0xFFFF);
+    legacy_info_out->old_pageins = (integer_t)old_pageins;
+    
+    /* Legacy name: truncate to 16 chars */
+    strncpy(legacy_info_out->old_name, modern_task->name, 15);
+    legacy_info_out->old_name[15] = '\0';
+    
+    /* Legacy flags: map modern flags to obsolete ones */
+    legacy_info_out->old_flags = 0;
+    if (modern_task->essential)
+        legacy_info_out->old_flags |= 0x01;  /* LEGACY_FLAG_ESSENTIAL */
+    if (modern_task->active)
+        legacy_info_out->old_flags |= 0x02;  /* LEGACY_FLAG_ACTIVE */
+    if (modern_task->ref_count > 1)
+        legacy_info_out->old_flags |= 0x04;  /* LEGACY_FLAG_REFERENCED */
+    
+    /* Fill legacy scheduler info if requested */
+    if (legacy_sched_out != NULL) {
+        /* Old quantum system (fixed 100ms quantum) */
+        legacy_sched_out->sched_quantum = 100;
+        
+        /* Map modern priority to old base priority */
+        legacy_sched_out->sched_base_priority = legacy_priority;
+        legacy_sched_out->sched_cur_priority = legacy_priority;
+        
+        /* Old max priority was 15 */
+        legacy_sched_out->sched_max_priority = 15;
+        
+        /* Fixed processor assignment (old API didn't support migration) */
+        legacy_sched_out->sched_processor = 0;
+        
+        /* Legacy flags */
+        legacy_sched_out->sched_flags = 0;
+        if (modern_task->sched_class == SCHED_CLASS_RT)
+            legacy_sched_out->sched_flags |= 0x01;  /* LEGACY_SCHED_RT */
+        
+        /* Old bucket scheduler system (deprecated) */
+        legacy_sched_out->sched_bucket = (modern_task->priority / 8) % 8;
+        
+        /* Epoch counter (ancient) */
+        legacy_sched_out->sched_epoch = (unsigned int)(now.seconds / 60);
+    }
+    
+    /* Handle legacy compatibility flags */
+    if (legacy_flags & LEGACY_FLAG_EMULATE_OVERFLOW) {
+        /* Emulate overflow conditions that old kernels had */
+        if (modern_task->faults > 65535) {
+            /* Simulate counter overflow wrap */
+            legacy_info_out->old_faults = (modern_task->faults % 65536);
+        }
+        
+        if (modern_task->pageins > 65535) {
+            legacy_info_out->old_pageins = (modern_task->pageins % 65536);
+        }
+    }
+    
+    if (legacy_flags & LEGACY_FLAG_ZERO_UNUSED) {
+        /* Zero out unused legacy fields for compatibility */
+        memset(legacy_info_out->old_pad, 0, sizeof(legacy_info_out->old_pad));
+    }
+    
+    task_unlock(modern_task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * task_compatibility_modern_bulk_adapter
+ *
+ * Provides modern high-volume data interface for task monitoring.
+ * Collects and stores large amounts of performance data without creating new tasks.
+ * Handles ring buffers, history arrays, and bulk data transfers.
+ */
+kern_return_t task_compatibility_modern_bulk_adapter(
+    task_t                      modern_task,
+    struct modern_task_bulk_data *bulk_data_out,
+    unsigned int                data_mask,
+    unsigned int                history_depth,
+    boolean_t                   reset_after_read)
+{
+    static unsigned long long last_cpu_time = 0;
+    static unsigned long long last_timestamp = 0;
+    static unsigned int history_index = 0;
+    struct time_value64 now;
+    unsigned long long current_timestamp;
+    unsigned long long delta_time;
+    unsigned long long delta_cpu;
+    unsigned int cpu_percent;
+    unsigned int i;
+    
+    if (modern_task == TASK_NULL || bulk_data_out == NULL)
+        return KERN_INVALID_ARGUMENT;
+    
+    if (history_depth > 1024)
+        history_depth = 1024;
+    
+    task_lock(modern_task);
+    simple_lock(&modern_task->os_task.stats_lock);
+    
+    read_time_stamp(current_time(), &now);
+    current_timestamp = time_value64_to_nanoseconds(now);
+    
+    /* Initialize history if first time */
+    if (last_timestamp == 0) {
+        last_timestamp = current_timestamp;
+        last_cpu_time = time_value64_to_nanoseconds(modern_task->total_user_time) +
+                        time_value64_to_nanoseconds(modern_task->total_system_time);
+    }
+    
+    /* Calculate current CPU usage percentage */
+    delta_time = current_timestamp - last_timestamp;
+    delta_cpu = (time_value64_to_nanoseconds(modern_task->total_user_time) +
+                 time_value64_to_nanoseconds(modern_task->total_system_time)) - last_cpu_time;
+    
+    if (delta_time > 0) {
+        cpu_percent = (unsigned int)((delta_cpu * 1000ULL) / delta_time);
+        if (cpu_percent > 1000) cpu_percent = 1000;
+    } else {
+        cpu_percent = 0;
+    }
+    
+    /* Update history ring buffers */
+    if (data_mask & MODERN_DATA_CPU_HISTORY) {
+        bulk_data_out->cpu_usage_history[history_index % history_depth] = cpu_percent;
+        
+        /* Fill remaining history if depth changed */
+        if (history_depth < 1024) {
+            for (i = history_index + 1; i < history_depth; i++) {
+                bulk_data_out->cpu_usage_history[i] = cpu_percent;
+            }
+        }
+    }
+    
+    if (data_mask & MODERN_DATA_MEMORY_HISTORY) {
+        unsigned long long memory_mb = modern_task->current_memory / (1024 * 1024);
+        bulk_data_out->memory_usage_history[history_index % history_depth] = (unsigned int)memory_mb;
+    }
+    
+    if (data_mask & MODERN_DATA_IO_HISTORY) {
+        bulk_data_out->io_history[history_index % history_depth] = 
+            modern_task->io_bytes_read + modern_task->io_bytes_written;
+    }
+    
+    if (data_mask & MODERN_DATA_FAULT_HISTORY) {
+        bulk_data_out->page_fault_history[history_index % history_depth] = 
+            modern_task->faults;
+    }
+    
+    if (data_mask & MODERN_DATA_CTX_HISTORY) {
+        bulk_data_out->context_switch_history[history_index % history_depth] = 
+            modern_task->context_switches;
+    }
+    
+    if (data_mask & MODERN_DATA_IPC_HISTORY) {
+        bulk_data_out->ipc_history[history_index % history_depth] = 
+            modern_task->messages_sent + modern_task->messages_received;
+    }
+    
+    /* Fill performance counters (if supported by hardware) */
+    if (data_mask & MODERN_DATA_PERF_COUNTERS) {
+        /* These would read actual hardware performance counters */
+        bulk_data_out->perf_instructions = read_instructions_counter();
+        bulk_data_out->perf_cycles = read_cycles_counter();
+        bulk_data_out->perf_branch_misses = read_branch_miss_counter();
+        bulk_data_out->perf_cache_misses = read_cache_miss_counter();
+        bulk_data_out->perf_memory_loads = read_memory_load_counter();
+        bulk_data_out->perf_memory_stores = read_memory_store_counter();
+    }
+    
+    /* Fill NUMA statistics */
+    if (data_mask & MODERN_DATA_NUMA_STATS) {
+        unsigned int node;
+        for (node = 0; node < 64 && node < numa_max_node(); node++) {
+            bulk_data_out->numa_local_access[node] = 
+                modern_task->numa_local_memory / (1024 * 1024);
+            bulk_data_out->numa_remote_access[node] = 
+                modern_task->numa_remote_memory / (1024 * 1024);
+            bulk_data_out->numa_foreign_access[node] = 
+                modern_task->numa_foreign_memory / (1024 * 1024);
+        }
+    }
+    
+    /* Fill cgroup statistics */
+    if (data_mask & MODERN_DATA_CGROUP_STATS) {
+        for (i = 0; i < 16; i++) {
+            bulk_data_out->cgroup_cpu_usage[i] = 
+                read_cgroup_cpu_usage(modern_task, i);
+            bulk_data_out->cgroup_memory_usage[i] = 
+                read_cgroup_memory_usage(modern_task, i);
+            bulk_data_out->cgroup_io_usage[i] = 
+                read_cgroup_io_usage(modern_task, i);
+        }
+    }
+    
+    /* Fill audit trail (ring buffer) */
+    if (data_mask & MODERN_DATA_AUDIT_TRAIL) {
+        bulk_data_out->audit_event_index = modern_task->audit_event_index;
+        for (i = 0; i < 256; i++) {
+            bulk_data_out->audit_events[i] = 
+                modern_task->audit_events[(modern_task->audit_event_index + i) % 256];
+        }
+    }
+    
+    /* Fill trace data */
+    if (data_mask & MODERN_DATA_TRACE_POINTS) {
+        for (i = 0; i < 4096; i++) {
+            bulk_data_out->trace_points[i] = 
+                modern_task->trace_data[(modern_task->trace_index + i) % 4096];
+        }
+        bulk_data_out->trace_index = modern_task->trace_index;
+    }
+    
+    /* Advance history index */
+    history_index = (history_index + 1) % history_depth;
+    
+    /* Reset counters if requested */
+    if (reset_after_read) {
+        /* Reset task statistics after reading */
+        modern_task->faults = 0;
+        modern_task->pageins = 0;
+        modern_task->cow_faults = 0;
+        modern_task->messages_sent = 0;
+        modern_task->messages_received = 0;
+        modern_task->context_switches = 0;
+        modern_task->voluntary_switches = 0;
+        modern_task->involuntary_switches = 0;
+        
+        /* Reset timestamps for next delta calculation */
+        last_timestamp = current_timestamp;
+        last_cpu_time = time_value64_to_nanoseconds(modern_task->total_user_time) +
+                        time_value64_to_nanoseconds(modern_task->total_system_time);
+        
+        /* Reset NUMA counters if requested */
+        if (data_mask & MODERN_DATA_RESET_NUMA) {
+            modern_task->numa_local_memory = 0;
+            modern_task->numa_remote_memory = 0;
+            modern_task->numa_foreign_memory = 0;
+        }
+        
+        /* Reset cgroup counters */
+        if (data_mask & MODERN_DATA_RESET_CGROUP) {
+            /* Would reset cgroup counters */
+        }
+    }
+    
+    simple_unlock(&modern_task->os_task.stats_lock);
+    task_unlock(modern_task);
+    
+    return KERN_SUCCESS;
+}
+
+/*
+ * Helper function: Read instructions counter (x86 RDPMC)
+ */
+static unsigned long long read_instructions_counter(void)
+{
+    unsigned long long instructions = 0;
+    /* In real implementation, this would use RDPMC instruction */
+    /* For now, return simulated value based on CPU time */
+    struct time_value64 now;
+    read_time_stamp(current_time(), &now);
+    return now.seconds * 1000000000ULL;
+}
+
+/*
+ * Helper function: Read cycles counter
+ */
+static unsigned long long read_cycles_counter(void)
+{
+    unsigned long long cycles = 0;
+    /* In real implementation, this would use RDTSC instruction */
+    struct time_value64 now;
+    read_time_stamp(current_time(), &now);
+    return now.seconds * 2500000000ULL; /* Assume 2.5GHz */
+}
+
+/*
+ * Helper function: Read branch miss counter
+ */
+static unsigned long long read_branch_miss_counter(void)
+{
+    /* Simulated branch miss counter */
+    static unsigned long long misses = 0;
+    misses += 1000;
+    return misses;
+}
+
+/*
+ * Helper function: Read cache miss counter
+ */
+static unsigned long long read_cache_miss_counter(void)
+{
+    /* Simulated cache miss counter */
+    static unsigned long long misses = 0;
+    misses += 500;
+    return misses;
+}
+
+/*
+ * Helper function: Read memory load counter
+ */
+static unsigned long long read_memory_load_counter(void)
+{
+    /* Simulated memory load counter */
+    static unsigned long long loads = 0;
+    loads += 10000;
+    return loads;
+}
+
+/*
+ * Helper function: Read memory store counter
+ */
+static unsigned long long read_memory_store_counter(void)
+{
+    /* Simulated memory store counter */
+    static unsigned long long stores = 0;
+    stores += 5000;
+    return stores;
+}
+
+/*
+ * Helper function: Get maximum NUMA node
+ */
+static unsigned int numa_max_node(void)
+{
+    /* In real implementation, would query ACPI/SRAT table */
+    return 4; /* Assume 4 NUMA nodes */
+}
+
+/*
+ * Helper functions for cgroup statistics
+ */
+static unsigned int read_cgroup_cpu_usage(task_t task, unsigned int cgroup_id)
+{
+    /* Would read from actual cgroup data */
+    return 0;
+}
+
+static unsigned int read_cgroup_memory_usage(task_t task, unsigned int cgroup_id)
+{
+    /* Would read from actual cgroup data */
+    return 0;
+}
+
+static unsigned int read_cgroup_io_usage(task_t task, unsigned int cgroup_id)
+{
+    /* Would read from actual cgroup data */
+    return 0;
+}
+
+/*
+ * Time conversion helper
+ */
+static unsigned long long time_value64_to_nanoseconds(struct time_value64 tv)
+{
+    return tv.seconds * 1000000000ULL + tv.microseconds * 1000ULL;
+}
+
+/*
+ * Legacy compatibility flags definition
+ */
+#define LEGACY_FLAG_EMULATE_OVERFLOW  0x00000001
+#define LEGACY_FLAG_ZERO_UNUSED       0x00000002
+#define LEGACY_FLAG_FORCE_24BIT       0x00000004
+#define LEGACY_FLAG_USE_OLD_SCHED     0x00000008
+
+/*
+ * Modern data mask flags
+ */
+#define MODERN_DATA_CPU_HISTORY       0x00000001
+#define MODERN_DATA_MEMORY_HISTORY    0x00000002
+#define MODERN_DATA_IO_HISTORY        0x00000004
+#define MODERN_DATA_FAULT_HISTORY     0x00000008
+#define MODERN_DATA_CTX_HISTORY       0x00000010
+#define MODERN_DATA_IPC_HISTORY       0x00000020
+#define MODERN_DATA_PERF_COUNTERS     0x00000040
+#define MODERN_DATA_NUMA_STATS        0x00000080
+#define MODERN_DATA_CGROUP_STATS      0x00000100
+#define MODERN_DATA_AUDIT_TRAIL       0x00000200
+#define MODERN_DATA_TRACE_POINTS      0x00000400
+#define MODERN_DATA_RESET_NUMA        0x00001000
+#define MODERN_DATA_RESET_CGROUP      0x00002000
+#define MODERN_DATA_RESET_ALL         0x00004000
+
+/*
+ * Audit event structure
+ */
+struct audit_event {
+    unsigned int    event_type;
+    unsigned long long timestamp;
+    unsigned int    uid;
+    unsigned int    pid;
+    char            command[64];
+    unsigned int    result;
+    unsigned int    data[8];
+};
