@@ -3,7 +3,6 @@
  * Added to vm/vm_init.c
  */
 
-#include <vm/vm_compressor.h>
 #include <kern/swap.h>
 #include <vm/vm_pager.h>
 #include <vm/vm_external.h>
